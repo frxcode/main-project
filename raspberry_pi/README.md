@@ -1,6 +1,6 @@
 # МАН — Raspberry Pi: перевірка робіт на ШІ
 
-Проєкт для зйомки учнівських робіт кнопкою на Raspberry Pi з виводом статусу на LCD 16x2 та індикацією світлодіодами. Фото зберігаються у папку `images/` для подальшої перевірки на ознаки ШІ.
+Проєкт для зйомки учнівських робіт кнопкою на Raspberry Pi з виводом статусу на LCD 16x2. Фото зберігаються у папку `images/` для подальшої перевірки на ознаки ШІ.
 
 ## Структура проєкту
 
@@ -14,16 +14,13 @@ main-project/
 
 ## Необхідне обладнання
 
-| Компонент              | Примітка                          |
-|------------------------|-----------------------------------|
-| Raspberry Pi 3/4/5     | Raspberry Pi OS (Bookworm/Bullseye) |
-| LCD 1602 + I2C модуль  | PCF8574, адреса зазвичай `0x27`   |
-| Кнопка (tactile)       | З внутрішнім pull-up              |
-| LED зелений            | + резистор ~220–330 Ω             |
-| LED жовтий             | + резистор ~220–330 Ω             |
-| LED червоний           | + резистор ~220–330 Ω             |
-| USB веб-камера         | Або модуль CSI (через OpenCV)     |
-| Макетна плата / дроти  | Dupont jumper wires               |
+| Компонент                    | Примітка                            |
+|------------------------------|-------------------------------------|
+| Raspberry Pi 3/4/5           | Raspberry Pi OS (Bookworm/Bullseye) |
+| LCD 1602 + I2C модуль        | PCF8574, адреса `0x27`              |
+| Модульна кнопка (G, V, S)    | 3 виводи                            |
+| USB веб-камера               | Через OpenCV                        |
+| Дроти Dupont                 | Для підключення                     |
 
 ---
 
@@ -31,59 +28,45 @@ main-project/
 
 > У коді використовується **BCM** (Broadcom GPIO numbers), не Physical/Board.
 
-### GPIO піни
+### Зведена таблиця
 
-| Пристрій        | Сигнал     | BCM пін | Physical пін | Примітка                          |
-|-----------------|------------|---------|--------------|-----------------------------------|
-| Кнопка          | SIG        | **17**  | 11           | Інший вивід → GND                 |
-| LED зелений     | анод (+)   | **22**  | 15           | Через резистор 220–330 Ω          |
-| LED жовтий      | анод (+)   | **27**  | 13           | Через резистор 220–330 Ω          |
-| LED червоний    | анод (+)   | **18**  | 12           | Через резистор 220–330 Ω          |
-| LCD I2C (SDA)   | SDA        | **2**   | 3            | Шина I2C1                         |
-| LCD I2C (SCL)   | SCL        | **3**   | 5            | Шина I2C1                         |
-| Живлення 5V     | VCC / 5V   | —       | 2 або 4      | Для LCD модуля                    |
-| Живлення 3.3V   | —          | —       | 1 або 17     | За потреби                        |
-| Земля           | GND        | —       | 6, 9, 14…    | Спільна GND для всіх компонентів  |
+| Пристрій              | Сигнал | BCM пін | Physical пін | Примітка        |
+|-----------------------|--------|---------|--------------|-----------------|
+| Кнопка                | S      | **17**  | 11           | Signal          |
+| Кнопка                | V      | —       | 1            | 3.3V            |
+| Кнопка                | G      | —       | GND          | Земля           |
+| LCD I2C               | SDA    | **2**   | 3            | Шина I2C1       |
+| LCD I2C               | SCL    | **3**   | 5            | Шина I2C1       |
+| LCD I2C               | VCC    | —       | 4            | 5V              |
+| LCD I2C               | GND    | —       | 6            | Земля           |
+| Веб-камера            | USB    | —       | USB-порт     | `VideoCapture(0)` |
 
-### Детальна схема підключення
-
-#### 1. Кнопка (BCM 17)
+### 1. Модульна кнопка (G, V, S) — BCM 17
 
 ```
-Raspberry Pi                Кнопка
-─────────────               ──────
-GPIO 17 (BCM)  ───────────► один контакт
-GND            ───────────► другий контакт
+Raspberry Pi              Кнопка (модуль)
+─────────────             ───────────────
+GND                 ────► G (Ground)
+3.3V (Pin 1)        ────► V (VCC)
+GPIO 17 (Pin 11)    ────► S (Signal)
 ```
 
-У `gpiozero` увімкнено внутрішній **pull-up**, тому зовнішній резистор не обов’язковий. При натисканні пін з’єднується з GND (LOW).
+У коді: `button = Button(17)`.
 
-#### 2. Світлодіоди
-
-```
-Raspberry Pi                    LED
-─────────────                   ───
-GPIO 22 (BCM) ──[220Ω]──►(+) зелений  (-)──► GND
-GPIO 27 (BCM) ──[220Ω]──►(+) жовтий   (-)──► GND
-GPIO 18 (BCM) ──[220Ω]──►(+) червоний (-)──► GND
-```
-
-- **Зелений (BCM 22)** — система готова (`System Ready`)
-- **Жовтий (BCM 27)** — іде зйомка (`Taking photo...`)
-- **Червоний (BCM 18)** — помилка зйомки
-
-#### 3. LCD 16x2 через I2C (PCF8574)
+### 2. LCD 16x2 через I2C (PCF8574)
 
 ```
-Raspberry Pi          LCD I2C модуль
-─────────────         ──────────────
-5V (pin 2/4)  ──────► VCC
-GND           ──────► GND
-GPIO 2 (SDA)  ──────► SDA
-GPIO 3 (SCL)  ──────► SCL
+Raspberry Pi              LCD I2C модуль
+─────────────             ──────────────
+GPIO 2 / SDA (Pin 3) ───► SDA
+GPIO 3 / SCL (Pin 5) ───► SCL
+5V (Pin 4)           ───► VCC
+GND (Pin 6)          ───► GND
 ```
 
-Типова I2C-адреса: **`0x27`** (іноді `0x3F`). Якщо дисплей не працює — перевірте адресу:
+У коді: `lcd = CharLCD('PCF8574', 0x27, port=1, cols=16, rows=2)`.
+
+Перевірка адреси I2C:
 
 ```bash
 sudo apt install -y i2c-tools
@@ -91,45 +74,27 @@ sudo raspi-config   # Interface Options → I2C → Enable
 sudo i2cdetect -y 1
 ```
 
-У `main.py` змініть константу `LCD_I2C_ADDRESS`, якщо потрібно.
+### 3. Веб-камера
 
-#### 4. Веб-камера
-
-Підключіть USB-камеру до будь-якого USB-порту Raspberry Pi. OpenCV відкриває її як `cv2.VideoCapture(0)`.
-
-Перевірка:
+Підключіть USB-камеру до будь-якого USB-порту. OpenCV: `cv2.VideoCapture(0)`.
 
 ```bash
 ls /dev/video*
-# або
-v4l2-ctl --list-devices
 ```
 
 ---
 
 ## Встановлення залежностей
 
-Виконайте на Raspberry Pi у терміналі:
-
 ```bash
-# Оновлення системи
 sudo apt update && sudo apt upgrade -y
-
-# Системні пакети для камери, I2C та Python
-sudo apt install -y python3-pip python3-venv i2c-tools \
-    libatlas-base-dev libcamera-apps
-
-# Увімкнути I2C (якщо ще не увімкнено)
+sudo apt install -y python3-pip python3-venv i2c-tools libatlas-base-dev
 sudo raspi-config nonint do_i2c 0
 
-# Перейти в папку проєкту
 cd ~/Desktop/main-project   # або ваш шлях
-
-# (Рекомендовано) віртуальне середовище
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Python-бібліотеки
 pip install --upgrade pip
 pip install gpiozero RPLCD smbus2 opencv-python
 ```
@@ -140,16 +105,15 @@ pip install gpiozero RPLCD smbus2 opencv-python
 pip install gpiozero RPLCD smbus2 opencv-python
 ```
 
-| Пакет            | Призначення                         |
-|------------------|-------------------------------------|
-| `gpiozero`       | Кнопка та світлодіоди               |
-| `RPLCD`          | LCD 16x2 через I2C                  |
-| `smbus2`         | I2C-шина для RPLCD                  |
-| `opencv-python`  | Веб-камера та збереження .jpg       |
+| Пакет            | Призначення                   |
+|------------------|-------------------------------|
+| `gpiozero`       | Кнопка                        |
+| `RPLCD`          | LCD 16x2 через I2C            |
+| `smbus2`         | I2C-шина для RPLCD            |
+| `opencv-python`  | Веб-камера та збереження .jpg |
 
-> На деяких образах Raspberry Pi OS зручніше ставити OpenCV з apt:
-> `sudo apt install -y python3-opencv`
-> тоді в venv використовуйте `python3 -m venv --system-site-packages .venv`
+> На деяких образах зручніше: `sudo apt install -y python3-opencv`  
+> тоді: `python3 -m venv --system-site-packages .venv`
 
 ---
 
@@ -165,12 +129,12 @@ python3 main.py
 
 1. Старт → ініціалізація LCD, перевірка камери.
 2. Якщо камери немає → на LCD: `Camera Error`.
-3. Якщо все добре → `Camera OK` / `System Ready`, зелений LED увімкнено.
+3. Якщо все добре → `Camera OK` / `System Ready`.
 4. Очікування натискання кнопки.
 5. Після натискання:
    - LCD: `Taking photo...`
-   - Знімок з камери → `images/photo_YYYYMMDD_HHMMSS.jpg`
-   - LCD: `Photo saved!` + коротке мигання всіх LED
+   - Знімок → `images/photo_YYYYMMDD_HHMMSS.jpg`
+   - LCD: `Photo saved!`
    - Повернення в `System Ready`
 6. Вихід: `Ctrl+C`
 
@@ -178,12 +142,9 @@ python3 main.py
 
 ## Обробка помилок
 
-Програма не падає при відключенні окремих компонентів:
-
-- LCD недоступний → повідомлення друкуються в термінал
+- LCD недоступний → повідомлення в термінал
 - Камера відсутня → `Camera Error` на LCD; при зйомці — `Photo Error`
-- Помилка збереження кадру → червоний LED + повідомлення на LCD
-- GPIO недоступний (наприклад, запуск не на Pi) → коректний вихід з повідомленням
+- Кнопка / GPIO недоступні → коректний вихід з повідомленням
 
 ---
 
