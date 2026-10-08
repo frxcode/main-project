@@ -1,33 +1,16 @@
 #!/usr/bin/env python3
-"""
-МАН — Raspberry Pi: перевірка робіт на ШІ
-Фотографування робіт кнопкою з виводом статусу на LCD 16x2.
-"""
-
 import sys
 import time
+import requests
 from datetime import datetime
 from pathlib import Path
 
-# Папка images/ — на рівень вище від raspberry_pi/
-BASE_DIR = Path(__file__).resolve().parent.parent
-IMAGES_DIR = BASE_DIR / "images"
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-
+# --- ВАЖЛИВО: ВПИШИ ТУТ IP СВОГО НОУТБУКА ---
+SERVER_URL = "http://192.168.X.X:8000/upload/"
 
 def init_lcd():
-    """
-    LCD 16x2 через I2C (PCF8574, адреса 0x27).
-
-    Підключення:
-      SDA -> GPIO 2 (Pin 3)
-      SCL -> GPIO 3 (Pin 5)
-      VCC -> 5V (Pin 4)
-      GND -> GND (Pin 6)
-    """
     try:
         from RPLCD.i2c import CharLCD
-
         lcd = CharLCD("PCF8574", 0x27, port=1, cols=16, rows=2)
         lcd.clear()
         return lcd
@@ -35,9 +18,7 @@ def init_lcd():
         print(f"[WARN] LCD недоступний: {e}")
         return None
 
-
 def lcd_write(lcd, line1="", line2=""):
-    """Вивід на LCD (2 рядки по 16 символів). Якщо LCD немає — у термінал."""
     if lcd is None:
         print(f"[LCD] {line1} | {line2}")
         return
@@ -50,12 +31,9 @@ def lcd_write(lcd, line1="", line2=""):
     except Exception as e:
         print(f"[WARN] Помилка запису на LCD: {e}")
 
-
 def init_camera():
-    """Вебкамера через OpenCV: cv2.VideoCapture(0)."""
     try:
         import cv2
-
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             return None, None
@@ -68,29 +46,16 @@ def init_camera():
         print(f"[WARN] Камера недоступна: {e}")
         return None, None
 
-
 def init_button():
-    """
-    Модульна кнопка (3 виводи: G, V, S) на BCM 17.
-
-    Підключення:
-      G (Ground) -> GND
-      V (VCC)    -> 3.3V (Pin 1)
-      S (Signal) -> GPIO 17 (Pin 11)
-    """
     try:
         from gpiozero import Button
-
-        # BCM 17 — сигнал кнопки (Pin 11)
         button = Button(17)
         return button
     except Exception as e:
         print(f"[WARN] Кнопка недоступна: {e}")
         return None
 
-
-def take_photo(cap, cv2_module):
-    """Знімок з камери → images/photo_YYYYMMDD_HHMMSS.jpg."""
+def take_photo_to_memory(cap, cv2_module):
     if cap is None or cv2_module is None:
         raise RuntimeError("Камера не ініціалізована")
 
@@ -98,15 +63,14 @@ def take_photo(cap, cv2_module):
     if not ret or frame is None:
         raise RuntimeError("Не вдалося зчитати кадр з камери")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = IMAGES_DIR / f"photo_{timestamp}.jpg"
-    if not cv2_module.imwrite(str(filename), frame):
-        raise RuntimeError(f"Не вдалося зберегти файл: {filename}")
-    return filename
-
+    # Кодуємо кадр у формат PNG
+    success, buffer = cv2_module.imencode('.png', frame)
+    if not success:
+        raise RuntimeError("Не вдалося закодувати фото")
+        
+    return buffer.tobytes()
 
 def cleanup(lcd, cap):
-    """Звільнення LCD та камери при виході."""
     print("\n[INFO] Завершення роботи...")
     if lcd is not None:
         try:
@@ -120,15 +84,13 @@ def cleanup(lcd, cap):
         except Exception:
             pass
 
-
 def main():
     print("[INFO] Старт системи МАН — перевірка робіт на ШІ")
-    print(f"[INFO] Фото зберігаються у: {IMAGES_DIR}")
+    print("[INFO] Режим: відправка фото (PNG) відразу на сервер")
 
     lcd = init_lcd()
     lcd_write(lcd, "Starting...", "Please wait")
 
-    # --- Камера ---
     cap, cv2_module = init_camera()
     if cap is None:
         lcd_write(lcd, "Camera Error", "Check webcam")
@@ -139,7 +101,6 @@ def main():
         time.sleep(1.5)
         lcd_write(lcd, "System Ready", "Press button")
 
-    # --- Кнопка ---
     button = init_button()
     if button is None:
         lcd_write(lcd, "Button Error", "Check wiring")
@@ -154,23 +115,47 @@ def main():
             try:
                 button.wait_for_press()
             except Exception as e:
-                print(f"[WARN] Помилка кнопки: {e}")
                 time.sleep(0.5)
                 continue
 
-            print("[INFO] Кнопку натиснуто — зйомка...")
+            print("\n[INFO] Кнопку натиснуто — зйомка...")
             lcd_write(lcd, "Taking photo...", "Please wait")
 
             try:
-                time.sleep(0.2)  # стабілізація автоекспозиції
-                path = take_photo(cap, cv2_module)
-                print(f"[INFO] Фото збережено: {path}")
-                lcd_write(lcd, "Photo saved!", path.name[:16])
+                time.sleep(0.2)
+                
+                photo_bytes = take_photo_to_memory(cap, cv2_module)
+                
+                lcd_write(lcd, "Sending...", "Please wait")
+                print(f"[INFO] Відправляємо на сервер {SERVER_URL}...")
+                
+                try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    # Генеруємо назву файлу з розширенням .png
+                    filename = f"work_{timestamp}.png"
+                    
+                    # Відправляємо байти з MIME-типом image/png
+                    response = requests.post(
+                        SERVER_URL, 
+                        files={'file': (filename, photo_bytes, 'image/png')}, 
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        lcd_write(lcd, "Sent OK!", "Success")
+                        print(f"[INFO] Успішно відправлено! Відповідь: {response.json()}")
+                    else:
+                        lcd_write(lcd, "Server Error", f"Code {response.status_code}")
+                        print(f"[ERROR] Помилка сервера: {response.status_code}")
+                except requests.exceptions.RequestException as e:
+                    lcd_write(lcd, "Server Error", "No Connection")
+                    print(f"[ERROR] Помилка з'єднання: {e}")
+
             except Exception as e:
                 print(f"[ERROR] Зйомка не вдалася: {e}")
                 lcd_write(lcd, "Photo Error", "Try again")
 
-            time.sleep(1.0)
+            time.sleep(2.5)
             lcd_write(lcd, "System Ready", "Press button")
 
             try:
@@ -184,7 +169,6 @@ def main():
     finally:
         cleanup(lcd, cap)
         print("[INFO] Програму завершено.")
-
 
 if __name__ == "__main__":
     main()
