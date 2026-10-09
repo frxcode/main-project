@@ -1,0 +1,13 @@
+[Unit]
+Description=Verifier Wi-Fi setup captive portal
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/wifi-portal/wifi_portal.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
