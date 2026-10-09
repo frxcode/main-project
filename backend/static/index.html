@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Перевірник на ШІ</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- ============================ АВТОРИЗАЦІЯ ВЧИТЕЛЯ ============================ -->
+    <div class="auth-screen" id="auth-screen">
+        <div class="auth-card">
+            <div class="auth-brand">Перевірник на ШІ</div>
+            <h2 id="auth-title">Вхід для вчителя</h2>
+            <p class="auth-sub" id="auth-subtitle">Увійдіть, щоб керувати перевіркою робіт учнів.</p>
+
+            <div class="auth-tabs">
+                <button type="button" id="tab-login" class="active" onclick="setAuthMode('login')">Увійти</button>
+                <button type="button" id="tab-signup" onclick="setAuthMode('signup')">Зареєструватися</button>
+            </div>
+
+            <div class="auth-error" id="auth-error"></div>
+
+            <form id="auth-form" onsubmit="return handleAuthSubmit(event)">
+                <div class="field">
+                    <label for="auth-email">Електронна пошта (Gmail)</label>
+                    <input type="email" id="auth-email" placeholder="teacher@gmail.com" autocomplete="email" required>
+                </div>
+                <div class="field">
+                    <label for="auth-password">Пароль</label>
+                    <input type="password" id="auth-password" placeholder="••••••••" autocomplete="current-password" minlength="6" required>
+                </div>
+                <button type="submit" class="btn-primary auth-submit" id="auth-submit-btn">Увійти</button>
+            </form>
+
+            <p class="auth-foot">Дані зберігаються локально у вашому браузері.</p>
+        </div>
+    </div>
+
+    <!-- ============================ ОСНОВНИЙ ДОДАТОК ============================ -->
+    <div id="app" class="hidden">
+        <header class="top-bar">
+            <div class="logo" onclick="loadMainView()" style="cursor: pointer;">Перевірник на ШІ</div>
+            <div class="top-bar-right">
+                <div class="user-chip">
+                    <span class="user-email" id="header-user-email">—</span>
+                    <span class="user-avatar" id="header-user-avatar">T</span>
+                </div>
+                <button class="btn-logout" onclick="logoutTeacher()">Вийти</button>
+                <div class="menu-container">
+                    <button class="menu-btn" onclick="toggleMenu(event)" aria-label="Меню">⋮</button>
+                    <div class="dropdown hidden" id="dropdown-menu">
+                        <button onclick="openPiMode()">Підключити Raspberry Pi</button>
+                        <button onclick="openPromptEditor()">Редагувати промпт ШІ</button>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <div class="content">
+            <div id="main-view">
+                <div class="page-head">
+                    <h1>Учні</h1>
+                    <p>Оберіть учня, щоб переглянути роботи та результати перевірки ШІ.</p>
+                </div>
+                <div class="grid" id="students-grid"></div>
+            </div>
+
+            <div id="student-view" class="hidden">
+                <div class="toolbar">
+                    <button class="btn-back" onclick="loadMainView()">← Назад</button>
+                    <h2 id="student-name">Ім'я Учня</h2>
+                </div>
+
+                <div id="latest-result-panel" class="latest-panel hidden">
+                    <img id="latest-result-image" src="" alt="Останнє фото перевірки" style="display: none;">
+                    <div class="latest-body">
+                        <div class="ai-title">Остання перевірка ШІ</div>
+                        <div class="ai-percent-display" id="latest-result-percent">0%</div>
+                        <p class="ai-desc" id="latest-result-description">Немає нових результатів.</p>
+                        <a id="latest-result-json" class="json-link" href="#" target="_blank" rel="noopener" style="display: none;">↗ Відкрити JSON-вердикт</a>
+                    </div>
+                </div>
+
+                <div class="folder-section">
+                    <div class="folder-header">
+                        <h3>📁 Перевірник (знімки з Pi / ручні)</h3>
+                        <label class="btn-upload">
+                            <input type="file" accept="image/*" capture="environment" onchange="uploadPhoto(event, 'verifier')" style="display: none;">
+                            + Додати в Перевірник
+                        </label>
+                    </div>
+                    <div class="gallery" id="verifier-gallery"></div>
+                </div>
+
+                <div class="folder-section">
+                    <div class="folder-header">
+                        <h3>📚 Завантажені фото для прикладу (Еталони)</h3>
+                        <label class="btn-upload btn-examples">
+                            <input type="file" accept="image/*" capture="environment" onchange="uploadPhoto(event, 'examples')" style="display: none;">
+                            + Додати еталон
+                        </label>
+                    </div>
+                    <div class="gallery" id="examples-gallery"></div>
+                </div>
+            </div>
+
+            <div id="pi-view" class="hidden">
+                <div class="toolbar">
+                    <button class="btn-back" onclick="loadMainView()">← Назад</button>
+                    <h2>Налаштування камери</h2>
+                </div>
+                <div class="pi-box">
+                    <h3>Оберіть учня для Raspberry Pi</h3>
+                    <select id="pi-student-select"></select>
+                    <button class="btn-primary" style="width: 100%; margin-top: 15px;" onclick="activatePiMode()">Увімкнути режим фото</button>
+                    <p id="pi-status" class="status-msg hidden"></p>
+                    <p id="pi-connection-status" class="status-msg hidden" style="margin-top: 10px;"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================ МОДАЛЬНЕ ВІКНО ФОТО ============================ -->
+    <div class="modal-overlay hidden" id="photo-modal">
+        <div class="modal-card" style="max-width: 980px;">
+            <button class="close-modal" onclick="closePhotoModal()">×</button>
+            <div class="modal-date" id="modal-date">Дата: --</div>
+
+            <div class="modal-grid">
+                <div>
+                    <img id="modal-img" class="modal-img" src="" alt="Фото роботи">
+                </div>
+
+                <div class="ai-result-box" style="min-height: 100%;">
+                    <div class="ai-title">Ймовірність штучного інтелекту</div>
+                    <div class="ai-percent-display" id="modal-percent">0%</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar-fill" id="modal-bar" style="width: 0%;"></div>
+                    </div>
+
+                    <div class="meta-line">
+                        <strong>Час перевірки:</strong>
+                        <div id="modal-timestamp">—</div>
+                    </div>
+
+                    <p class="ai-desc" id="modal-desc" style="margin-top: 16px; white-space: pre-wrap;">Натисніть "Запустити аналіз ШІ"...</p>
+                </div>
+            </div>
+
+            <div class="modal-actions" id="modal-actions">
+                <button class="btn-primary" id="btn-analyze" onclick="runManualAnalysis()">Запустити аналіз ШІ</button>
+                <button class="btn-secondary" onclick="moveToExamples()">Завантажити в Приклади</button>
+                <button class="btn-danger" onclick="deleteCurrentPhoto()">Видалити з перевірника</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================ МОДАЛЬНЕ ВІКНО ПРОМПТУ ============================ -->
+    <div class="modal-overlay hidden" id="prompt-modal">
+        <div class="modal-card" style="max-width: 900px;">
+            <button class="close-modal" onclick="closePromptEditor()">×</button>
+            <h3 style="margin: 0 0 14px;">Редагувати промпт ШІ</h3>
+            <textarea id="prompt-editor-input" class="prompt-textarea" rows="18"></textarea>
+            <div class="modal-actions" style="justify-content: flex-end;">
+                <button class="btn-secondary" onclick="closePromptEditor()">Скасувати</button>
+                <button class="btn-primary" onclick="savePromptEditor()">Зберегти</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentStudentId = null;
+        let selectedPhotoUrl = null;
+        let lastLatestResultSignature = null;
+
+        /* ============================ АВТОРИЗАЦІЯ ВЧИТЕЛЯ (серверна БД) ============================ */
+        let authMode = 'login';
+        let currentTeacherEmail = null;
+
+        function isAuthenticated() {
+            return !!currentTeacherEmail;
+        }
+
+        function showAuthError(message) {
+            const box = document.getElementById('auth-error');
+            box.textContent = message;
+            box.classList.add('show');
+        }
+
+        function clearAuthError() {
+            document.getElementById('auth-error').classList.remove('show');
+        }
+
+        function setAuthMode(mode) {
+            authMode = mode;
+            clearAuthError();
+            const isLogin = mode === 'login';
+            document.getElementById('tab-login').classList.toggle('active', isLogin);
+            document.getElementById('tab-signup').classList.toggle('active', !isLogin);
+            document.getElementById('auth-title').textContent = isLogin ? 'Вхід для вчителя' : 'Реєстрація вчителя';
+            document.getElementById('auth-subtitle').textContent = isLogin
+                ? 'Увійдіть, щоб керувати перевіркою робіт учнів.'
+                : 'Створіть обліковий запис, щоб почати перевіряти роботи.';
+            document.getElementById('auth-submit-btn').textContent = isLogin ? 'Увійти' : 'Створити акаунт';
+            document.getElementById('auth-password').setAttribute('autocomplete', isLogin ? 'current-password' : 'new-password');
+        }
+
+        async function handleAuthSubmit(event) {
+            event.preventDefault();
+            clearAuthError();
+
+            const email = document.getElementById('auth-email').value.trim().toLowerCase();
+            const password = document.getElementById('auth-password').value;
+
+            if (!/^[^\s@]+@gmail\.com$/.test(email)) {
+                showAuthError('Введіть коректну адресу Gmail (наприклад, name@gmail.com).');
+                return false;
+            }
+            if (password.length < 6) {
+                showAuthError('Пароль має містити щонайменше 6 символів.');
+                return false;
+            }
+
+            const endpoint = authMode === 'signup' ? '/api/auth/register' : '/api/auth/login';
+            const submitBtn = document.getElementById('auth-submit-btn');
+            submitBtn.disabled = true;
+
+            try {
+                const data = await fetchJson(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ email, password })
+                });
+                currentTeacherEmail = data.email || email;
+                document.getElementById('auth-form').reset();
+                enterApp();
+            } catch (error) {
+                showAuthError(error.message || 'Не вдалося авторизуватися.');
+            } finally {
+                submitBtn.disabled = false;
+            }
+            return false;
+        }
+
+        function enterApp() {
+            const email = currentTeacherEmail;
+            document.getElementById('header-user-email').textContent = email || '—';
+            document.getElementById('header-user-avatar').textContent = (email || 'T').charAt(0).toUpperCase();
+            document.getElementById('auth-screen').classList.add('hidden');
+            document.getElementById('app').classList.remove('hidden');
+            loadMainView();
+        }
+
+        async function logoutTeacher() {
+            try {
+                await fetchJson('/api/auth/logout', { method: 'POST', credentials: 'include' });
+            } catch (error) {
+                console.warn('Logout error:', error);
+            }
+            currentTeacherEmail = null;
+            document.getElementById('app').classList.add('hidden');
+            document.getElementById('auth-screen').classList.remove('hidden');
+            setAuthMode('login');
+        }
+
+        async function initAuth() {
+            try {
+                const data = await fetchJson('/api/auth/me', { credentials: 'include' });
+                currentTeacherEmail = data.email;
+                enterApp();
+            } catch (error) {
+                currentTeacherEmail = null;
+                document.getElementById('auth-screen').classList.remove('hidden');
+                setAuthMode('login');
+            }
+        }
+
+        /* ============================ ОСНОВНА ЛОГІКА ============================ */
+        async function fetchJson(url, options = {}) {
+            const response = await fetch(url, options);
+            const contentType = response.headers.get('content-type') || '';
+            const body = contentType.includes('application/json') ? await response.json() : await response.text();
+
+            if (!response.ok) {
+                const errorMessage = typeof body === 'object' && body && body.detail ? body.detail : (typeof body === 'string' ? body : 'Unknown error');
+                throw new Error(errorMessage);
+            }
+
+            return body;
+        }
+
+        function showAlertAndThrow(message) {
+            alert(message);
+            throw new Error(message);
+        }
+
+        function toggleMenu(event) {
+            event.stopPropagation();
+            document.getElementById('dropdown-menu').classList.toggle('hidden');
+        }
+        window.onclick = () => document.getElementById('dropdown-menu').classList.add('hidden');
+
+        function initials(firstName, lastName) {
+            return `${(firstName || '').charAt(0)}${(lastName || '').charAt(0)}`.toUpperCase() || '?';
+        }
+
+        async function loadMainView() {
+            hideAllViews();
+            document.getElementById('main-view').classList.remove('hidden');
+
+            try {
+                const data = await fetchJson('/api/students');
+                const grid = document.getElementById('students-grid');
+                grid.innerHTML = '';
+
+                data.students.forEach(s => {
+                    const tile = document.createElement('div');
+                    tile.className = 'tile student-tile';
+                    tile.innerHTML = `<div class="tile-avatar">${initials(s.first_name, s.last_name)}</div><div class="tile-name">${s.first_name}<br>${s.last_name}</div>`;
+                    tile.onclick = () => openStudent(s.id, s.first_name, s.last_name);
+                    grid.appendChild(tile);
+                });
+
+                const addTile = document.createElement('div');
+                addTile.className = 'tile add-tile';
+                addTile.innerHTML = '<div class="plus">+</div><div class="tile-name">Створити учня</div>';
+                addTile.onclick = promptAddStudent;
+                grid.appendChild(addTile);
+            } catch (error) {
+                alert(`Помилка завантаження списку учнів: ${error.message}`);
+            }
+        }
+
+        async function openStudent(id, firstName, lastName) {
+            currentStudentId = id;
+            document.getElementById('student-name').textContent = `${firstName} ${lastName}`;
+            hideAllViews();
+            document.getElementById('student-view').classList.remove('hidden');
+            await loadStudentFiles();
+            await refreshLatestResult();
+        }
+
+        function getLatestWork(student) {
+            const works = Array.isArray(student && student.works) ? student.works : [];
+            if (!works.length) return null;
+            return works[works.length - 1];
+        }
+
+        function renderLatestResult(student, work) {
+            const panel = document.getElementById('latest-result-panel');
+            const image = document.getElementById('latest-result-image');
+            const percent = document.getElementById('latest-result-percent');
+            const description = document.getElementById('latest-result-description');
+            const jsonLink = document.getElementById('latest-result-json');
+
+            if (!student || !work) {
+                panel.classList.add('hidden');
+                image.style.display = 'none';
+                jsonLink.style.display = 'none';
+                return;
+            }
+
+            const filename = work.filename || `${work.file_hash || work.hash || 'result'}.png`;
+            const photoUrl = `/uploads/${student.folder_name}/verifier/${filename}`;
+            const jsonFilename = filename.replace(/\.png$/i, '.json');
+            const jsonUrl = `/uploads/${student.folder_name}/verifier/${jsonFilename}`;
+
+            image.src = photoUrl;
+            image.style.display = 'block';
+            percent.textContent = `${Number(work.ai_percent || 0)}%`;
+            description.textContent = work.description || 'Результат перевірки відсутній.';
+
+            jsonLink.href = jsonUrl;
+            jsonLink.style.display = 'inline-flex';
+            panel.classList.remove('hidden');
+        }
+
+        async function refreshLatestResult() {
+            if (!currentStudentId) return;
+
+            try {
+                const data = await fetchJson('/api/students');
+                const student = (data.students || []).find(s => Number(s.id) === Number(currentStudentId));
+                if (!student) return;
+
+                const work = getLatestWork(student);
+                if (!work) {
+                    renderLatestResult(null, null);
+                    return;
+                }
+
+                const signature = `${student.id}:${work.filename || work.file_hash || work.hash}:${work.ai_percent}:${work.description}:${work.timestamp || ''}`;
+                if (lastLatestResultSignature !== signature) {
+                    lastLatestResultSignature = signature;
+                    renderLatestResult(student, work);
+                }
+            } catch (error) {
+                console.error('Помилка оновлення останнього результату:', error);
+            }
+        }
+
+        async function loadStudentFiles() {
+            if (!currentStudentId) return;
+
+            try {
+                const data = await fetchJson(`/api/students/${currentStudentId}/files`);
+                renderGallery('verifier-gallery', data.verifier || [], true);
+                renderGallery('examples-gallery', data.examples || [], false);
+            } catch (error) {
+                alert(`Помилка отримання файлів учня: ${error.message}`);
+            }
+        }
+
+        function renderGallery(elementId, photos, isVerifier) {
+            const gallery = document.getElementById(elementId);
+            gallery.innerHTML = '';
+            if (!photos.length) {
+                gallery.innerHTML = '<p class="empty-note">Папка порожня</p>';
+                return;
+            }
+
+            photos.forEach(url => {
+                const img = document.createElement('img');
+                img.src = url;
+                img.onclick = () => openPhotoModal(url, isVerifier);
+                gallery.appendChild(img);
+            });
+        }
+
+        async function uploadPhoto(event, folder) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('folder', folder);
+
+            try {
+                await fetchJson(`/api/students/${currentStudentId}/upload`, { method: 'POST', body: formData });
+                event.target.value = '';
+                await loadStudentFiles();
+            } catch (error) {
+                alert(`Помилка завантаження фото: ${error.message}`);
+            }
+        }
+
+        function formatTimestamp(unixTimestamp) {
+            if (!unixTimestamp) return '—';
+            const date = new Date(Number(unixTimestamp) * 1000);
+            if (Number.isNaN(date.getTime())) return '—';
+            return date.toLocaleString('uk-UA', {
+                day: '2-digit',
+                month: '2-digit',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        async function openPhotoModal(url, isVerifier) {
+            selectedPhotoUrl = url;
+            document.getElementById('modal-img').src = url;
+
+            const match = url.match(/work_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+            if (match) {
+                document.getElementById('modal-date').textContent = `Дата: ${match[3]}.${match[2]}.${match[1]} о ${match[4]}:${match[5]}`;
+            } else {
+                document.getElementById('modal-date').textContent = 'Дата: невідома';
+            }
+
+            document.getElementById('modal-percent').textContent = '--%';
+            document.getElementById('modal-bar').style.width = '0%';
+            document.getElementById('modal-desc').textContent = 'Підвантажую результат перевірки...';
+            document.getElementById('modal-timestamp').textContent = '—';
+            document.getElementById('modal-actions').style.display = isVerifier ? 'flex' : 'none';
+            document.getElementById('photo-modal').classList.remove('hidden');
+
+            try {
+                const filename = url.split('/').pop();
+                const jsonFilename = filename.replace(/\.[^.]+$/i, '.json');
+                const jsonUrl = url.replace(filename, jsonFilename);
+
+                const response = await fetchJson(jsonUrl, { method: 'GET' });
+                if (response && typeof response === 'object') {
+                    const aiPercent = Number(response.ai_percent ?? 0);
+                    const description = response.description || 'Опис відсутній.';
+                    const timestamp = response.timestamp ?? null;
+
+                    document.getElementById('modal-percent').textContent = `${aiPercent}%`;
+                    document.getElementById('modal-bar').style.width = `${aiPercent}%`;
+                    document.getElementById('modal-desc').textContent = description;
+                    document.getElementById('modal-timestamp').textContent = formatTimestamp(timestamp);
+                } else {
+                    document.getElementById('modal-desc').textContent = 'JSON-результат не знайдено або порожній.';
+                }
+            } catch (error) {
+                console.warn('JSON verdict not loaded:', error);
+                document.getElementById('modal-desc').textContent = 'JSON-результат не знайдено для цього фото.';
+            }
+        }
+
+        function closePhotoModal() {
+            document.getElementById('photo-modal').classList.add('hidden');
+        }
+
+        async function runManualAnalysis() {
+            const descBox = document.getElementById('modal-desc');
+            const percentBox = document.getElementById('modal-percent');
+            const barBox = document.getElementById('modal-bar');
+
+            descBox.textContent = '⏳ Аналізуємо роботу за критеріями та еталонами...';
+            percentBox.textContent = '...';
+
+            const formData = new FormData();
+            formData.append('student_id', currentStudentId);
+            formData.append('photo_url', selectedPhotoUrl);
+
+            try {
+                const data = await fetchJson('/api/photo/analyze', { method: 'POST', body: formData });
+                if (data.status === 'success') {
+                    const result = data.result;
+                    const percent = Number(result.ai_percent || 0);
+                    percentBox.textContent = `${percent}%`;
+                    barBox.style.width = `${percent}%`;
+                    descBox.textContent = result.description || 'Аналіз завершено.';
+                } else {
+                    descBox.textContent = data.message || 'Помилка при аналізі ШІ.';
+                }
+            } catch (error) {
+                alert(`Помилка аналізу фото: ${error.message}`);
+                descBox.textContent = 'Помилка при аналізі ШІ.';
+            }
+        }
+
+        async function moveToExamples() {
+            const formData = new FormData();
+            formData.append('student_id', currentStudentId);
+            formData.append('photo_url', selectedPhotoUrl);
+
+            try {
+                await fetchJson('/api/photo/move-to-examples', { method: 'POST', body: formData });
+                closePhotoModal();
+                await loadStudentFiles();
+            } catch (error) {
+                alert(`Не вдалося перемістити фото: ${error.message}`);
+            }
+        }
+
+        async function deleteCurrentPhoto() {
+            if (!confirm('Видалити це фото?')) return;
+            const formData = new FormData();
+            formData.append('student_id', currentStudentId);
+            formData.append('photo_url', selectedPhotoUrl);
+
+            try {
+                await fetchJson('/api/photo/delete', { method: 'POST', body: formData });
+                closePhotoModal();
+                await loadStudentFiles();
+            } catch (error) {
+                alert(`Не вдалося видалити фото: ${error.message}`);
+            }
+        }
+
+        async function openPromptEditor() {
+            try {
+                const data = await fetchJson('/api/prompt');
+                document.getElementById('prompt-editor-input').value = data && data.prompt ? data.prompt : '';
+                document.getElementById('prompt-modal').classList.remove('hidden');
+            } catch (error) {
+                alert(`Не вдалося завантажити промпт: ${error.message}`);
+            }
+        }
+
+        function closePromptEditor() {
+            document.getElementById('prompt-modal').classList.add('hidden');
+        }
+
+        async function savePromptEditor() {
+            const text = document.getElementById('prompt-editor-input').value.trim();
+            if (!text) {
+                alert('Промпт не може бути порожнім');
+                return;
+            }
+
+            try {
+                await fetchJson('/api/prompt', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt: text })
+                });
+                alert('Промпт успішно оновлено');
+                closePromptEditor();
+            } catch (error) {
+                alert(`Помилка збереження промпту: ${error.message}`);
+            }
+        }
+
+        async function openPiMode() {
+            hideAllViews();
+            document.getElementById('pi-view').classList.remove('hidden');
+
+            try {
+                const data = await fetchJson('/api/students');
+                const select = document.getElementById('pi-student-select');
+                select.innerHTML = '';
+
+                data.students.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.id;
+                    opt.textContent = `${s.first_name} ${s.last_name}`;
+                    select.appendChild(opt);
+                });
+            } catch (error) {
+                alert(`Помилка завантаження учнів для Raspberry Pi: ${error.message}`);
+            }
+        }
+
+        async function activatePiMode() {
+            const studentId = document.getElementById('pi-student-select').value;
+            const formData = new FormData();
+            formData.append('student_id', studentId);
+
+            try {
+                const response = await fetchJson('/api/students/select', { method: 'POST', body: formData });
+                const status = document.getElementById('pi-status');
+                status.classList.remove('hidden');
+                status.textContent = response && response.status === 'success' ? '✅ Raspberry Pi успішно налаштовано на обраного учня!' : '⚠️ Не вдалося призначити учня';
+            } catch (error) {
+                alert(`Помилка вибору учня для Raspberry Pi: ${error.message}`);
+            }
+        }
+
+        async function pingRaspberryPi() {
+            try {
+                const response = await fetchJson('/api/pi/status');
+                const el = document.getElementById('pi-connection-status');
+                el.classList.remove('hidden');
+
+                if (response && response.is_online) {
+                    el.textContent = 'Raspberry Pi connected';
+                    el.style.color = '#16a34a';
+                } else {
+                    el.textContent = 'Raspberry Pi disconnected';
+                    el.style.color = '#e5484d';
+                }
+            } catch (error) {
+                const el = document.getElementById('pi-connection-status');
+                el.classList.remove('hidden');
+                el.textContent = 'Raspberry Pi disconnected';
+                el.style.color = '#e5484d';
+            }
+        }
+
+        function hideAllViews() {
+            document.getElementById('main-view').classList.add('hidden');
+            document.getElementById('student-view').classList.add('hidden');
+            document.getElementById('pi-view').classList.add('hidden');
+        }
+
+        async function promptAddStudent() {
+            const firstName = prompt("Ім'я учня:");
+            if (!firstName) return;
+            const lastName = prompt("Прізвище учня:");
+            if (!lastName) return;
+
+            const formData = new FormData();
+            formData.append('first_name', firstName);
+            formData.append('last_name', lastName);
+
+            try {
+                await fetchJson('/api/students/add', { method: 'POST', body: formData });
+                await loadMainView();
+            } catch (error) {
+                alert(`Не вдалося створити учня: ${error.message}`);
+            }
+        }
+
+        /* ============================ ІНІЦІАЛІЗАЦІЯ ============================ */
+        initAuth();
+
+        setInterval(() => {
+            if (!isAuthenticated()) return;
+            pingRaspberryPi();
+        }, 3000);
+
+        setInterval(async () => {
+            if (!isAuthenticated()) return;
+            if (document.getElementById('student-view').classList.contains('hidden')) {
+                return;
+            }
+            await refreshLatestResult();
+        }, 3000);
+    </script>
+</body>
+</html>

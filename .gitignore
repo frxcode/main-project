@@ -7,3 +7,10 @@ __pycache__/
 *.jpg
 !images/.gitkeep
 .DS_Store
+
+# secrets / local state
+backend/1ll
+backend/1ll.pub
+backend/auth.db
+*.pem
+*.key

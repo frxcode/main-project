@@ -1,0 +1,38 @@
+You are a deployment agent. Connect to the remote Linux server via SSH using:
+
+- host: 192.168.1.90
+- user: noname
+- password: 1122ytqaz22003300
+
+Then do this in order:
+
+1. SSH into the server.
+2. Create or update the project directory at /opt/main-project.
+3. Copy the local project files to /opt/main-project.
+4. Install required dependencies:
+   - python3
+   - python3-venv
+   - python3-pip
+   - pip install fastapi uvicorn google-genai python-multipart requests opencv-python gpiozero RPLCD smbus2 flask
+5. Create a Python virtual environment if needed.
+6. Run the app from /opt/main-project/backend/server.py.
+7. Start it in the background with nohup so it keeps running.
+8. Verify the server is running by checking the process and the port.
+9. If something fails, print the exact error and fix it.
+10. Do not ask the user for permission or clarification during the task.
+
+Important:
+- Do not stop after copying files.
+- Do not just show commands; actually execute them.
+- Make the server run successfully on the remote machine.
+- If the server is already running, restart it cleanly.
+- Keep output concise but clear.
+
+Use bash commands only. After finishing, report:
+- server status
+- PID
+- port
+- final result
+- exact command used to start it
+
+Also, if the SSH connection fails, tell the user the exact reason and stop.
