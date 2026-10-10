@@ -38,6 +38,11 @@ LED_DMA = 10
 LED_CHANNEL = 0
 LED_BRIGHTNESS = 100
 LED_INVERT = False
+LED_FRAME_DELAY_S = 0.04
+LED_TRANSITION_ALPHA = 0.18
+RAINBOW_SPEED = 0.08
+PULSE_SPEED = 2.0
+RESULT_PULSE_SPEED = 1.1
 
 SYNC_INTERVAL_S = 2.0
 RESULT_HOLD_S = 4.0
@@ -144,6 +149,7 @@ class LedStrip:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._phase = 0.0
+        self._current_colors = [(0, 0, 0) for _ in range(count)]
         self._init_pixels(pin, count)
 
     def _init_pixels(self, pin: int, count: int):
@@ -216,17 +222,15 @@ class LedStrip:
             try:
                 if mode == LedMode.STANDBY:
                     self._draw_rainbow()
-                    time.sleep(0.03)
                 elif mode == LedMode.PROCESSING:
                     self._draw_pulse_blue()
-                    time.sleep(0.03)
                 else:
                     self._draw_solid(result_color)
-                    time.sleep(0.05)
+                time.sleep(LED_FRAME_DELAY_S)
             except Exception as exc:
                 print(f"[WARN] LED frame failed: {exc}", flush=True)
                 time.sleep(0.2)
-            self._phase += 0.03
+            self._phase += LED_FRAME_DELAY_S
 
     def _show(self):
         if self._pixels is None:
@@ -243,37 +247,52 @@ class LedStrip:
     def _clear(self):
         if self._pixels is None:
             return
+        self._current_colors = [(0, 0, 0) for _ in range(self.count)]
         for i in range(self.count):
             self._set_pixel(i, 0, 0, 0)
+        self._show()
+
+    def _draw_colors(self, target_colors):
+        if self._pixels is None:
+            return
+
+        blended = []
+        for i, target in enumerate(target_colors):
+            old = self._current_colors[i]
+            color = tuple(
+                int(old[channel] + (target[channel] - old[channel]) * LED_TRANSITION_ALPHA)
+                for channel in range(3)
+            )
+            blended.append(color)
+            self._set_pixel(i, *color)
+
+        self._current_colors = blended
         self._show()
 
     def _draw_rainbow(self):
         if self._pixels is None:
             return
+        colors = []
         for i in range(self.count):
-            hue = (self._phase * 0.35 + i / max(1, self.count)) % 1.0
+            hue = (self._phase * RAINBOW_SPEED + i / max(1, self.count)) % 1.0
             r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 0.55)
-            self._set_pixel(i, r * 255, g * 255, b * 255)
-        self._show()
+            colors.append((r * 255, g * 255, b * 255))
+        self._draw_colors(colors)
 
     def _draw_pulse_blue(self):
         if self._pixels is None:
             return
-        level = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(self._phase * 4.0))
+        level = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(self._phase * PULSE_SPEED))
         b = int(255 * level)
         g = int(40 * level)
-        for i in range(self.count):
-            self._set_pixel(i, 0, g, b)
-        self._show()
+        self._draw_colors([(0, g, b) for _ in range(self.count)])
 
     def _draw_solid(self, color):
         if self._pixels is None:
             return
         r, g, b = color
-        level = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(self._phase * 2.0))
-        for i in range(self.count):
-            self._set_pixel(i, r * level, g * level, b * level)
-        self._show()
+        level = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(self._phase * RESULT_PULSE_SPEED))
+        self._draw_colors([(r * level, g * level, b * level) for _ in range(self.count)])
 
 
 def sync_with_server():
