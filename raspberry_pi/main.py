@@ -3,7 +3,7 @@
 МАН — Raspberry Pi: перевірка робіт на ШІ.
 
 Піни (BCM):
-  SK6812 / WS2812 data  → GPIO 26  (живлення стрічки — зовнішні 5V, GND спільний)
+  SK6812 / WS2812 data  → GPIO 12  (живлення стрічки — зовнішні 5V, GND спільний)
   Фізична кнопка        → GPIO 17  (S→GPIO17, V→3.3V, G→GND; pull_up у коді)
   Активний баззер       → GPIO 13
   LCD 16x2 I2C          → адреса 0x27 (SDA GPIO 2, SCL GPIO 3)
@@ -26,7 +26,7 @@ from RPLCD.i2c import CharLCD
 # ---------------------------------------------------------------------------
 # Піни / периферія
 # ---------------------------------------------------------------------------
-LED_PIN = 26
+LED_PIN = 12
 LED_BITBANG_CLOCK_PIN = 16  # фіктивний CLK для bitbang SPI (не підключати)
 BUTTON_PIN = 17
 BUZZER_PIN = 13
@@ -144,7 +144,21 @@ class LedStrip:
     def _init_pixels(self, pin: int, count: int):
         brightness = max(0.05, min(1.0, LED_BRIGHTNESS / 255.0))
 
-        # GPIO 26 не підтримується rpi_ws281x DMA — bitbang SPI (MOSI=D26)
+        if pin in (10, 12, 13, 18, 19, 21):
+            try:
+                from rpi_ws281x import PixelStrip, Color  # type: ignore
+
+                self._Color = Color
+                strip = PixelStrip(count, pin, 800_000, 10, False, LED_BRIGHTNESS, 0)
+                strip.begin()
+                self._pixels = strip
+                self._backend = "rpi_ws281x"
+                print(f"[SYSTEM] LED strip on GPIO {pin} via rpi_ws281x, n={count}", flush=True)
+                return
+            except Exception as exc:
+                print(f"[WARN] rpi_ws281x init failed: {exc}", flush=True)
+
+        # Fallback for unsupported DMA pins: bitbang SPI (MOSI=LED_PIN)
         try:
             import board
             import neopixel_spi as neo_spi
@@ -176,19 +190,20 @@ class LedStrip:
         except Exception as exc:
             print(f"[WARN] NeoPixel bitbang init failed: {exc}", flush=True)
 
-        try:
-            from rpi_ws281x import PixelStrip, Color  # type: ignore
+        if self._pixels is None:
+            try:
+                from rpi_ws281x import PixelStrip, Color  # type: ignore
 
-            self._Color = Color
-            strip = PixelStrip(count, pin, 800_000, 10, False, LED_BRIGHTNESS, 0)
-            strip.begin()
-            self._pixels = strip
-            self._backend = "rpi_ws281x"
-            print(f"[SYSTEM] LED strip on GPIO {pin} via rpi_ws281x, n={count}", flush=True)
-        except Exception as exc:
-            print(f"[WARN] LED strip unavailable: {exc}", flush=True)
-            self._pixels = None
-            self._backend = None
+                self._Color = Color
+                strip = PixelStrip(count, pin, 800_000, 10, False, LED_BRIGHTNESS, 0)
+                strip.begin()
+                self._pixels = strip
+                self._backend = "rpi_ws281x"
+                print(f"[SYSTEM] LED strip on GPIO {pin} via rpi_ws281x, n={count}", flush=True)
+            except Exception as exc:
+                print(f"[WARN] LED strip unavailable: {exc}", flush=True)
+                self._pixels = None
+                self._backend = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
