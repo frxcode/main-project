@@ -38,7 +38,7 @@ LED_BRIGHTNESS = 48
 SYNC_INTERVAL_S = 2.0
 RESULT_HOLD_S = 4.0
 
-SERVER_URL = "http://192.168.1.90:8000"
+SERVER_URL = "http://192.168.1.90:4576"
 
 last_line1, last_line2 = "", ""
 server_connected = False
@@ -470,7 +470,9 @@ def main():
                 current_student = sync_with_server()
                 last_sync = time.time()
 
-            if current_student == "None":
+            if not server_connected:
+                update_lcd(lcd, "System fail", "Code 301")
+            elif current_student == "None":
                 update_lcd(lcd, "Choose student", "web")
             elif not button_pressed:
                 student_text = current_student[:16]
