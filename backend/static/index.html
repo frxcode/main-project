@@ -288,6 +288,14 @@
             const body = contentType.includes('application/json') ? await response.json() : await response.text();
 
             if (!response.ok) {
+                // Сесія протухла/недійсна — повертаємо на екран входу
+                if (response.status === 401 && isAuthenticated() && !url.startsWith('/api/auth/')) {
+                    currentTeacherEmail = null;
+                    document.getElementById('app').classList.add('hidden');
+                    document.getElementById('auth-screen').classList.remove('hidden');
+                    setAuthMode('login');
+                    showAuthError('Сесія завершилась. Увійдіть знову.');
+                }
                 const errorMessage = typeof body === 'object' && body && body.detail ? body.detail : (typeof body === 'string' ? body : 'Unknown error');
                 throw new Error(errorMessage);
             }

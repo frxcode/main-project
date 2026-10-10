@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py prompt.txt students.json ./ 
+COPY server.py db.py prompt.txt ./
 COPY static ./static
 
 RUN mkdir -p uploaded_images

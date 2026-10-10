@@ -11,6 +11,10 @@ __pycache__/
 # secrets / local state
 backend/1ll
 backend/1ll.pub
-backend/auth.db
 *.pem
 *.key
+
+# runtime data (живе на сервері, не в git)
+backend/*.db
+backend/students.json
+backend/uploaded_images/
