@@ -334,6 +334,11 @@ def next_student_on_server():
         return "None"
 
 
+def has_student(student_name: str) -> bool:
+    name = (student_name or "").strip()
+    return bool(name) and name.lower() != "none"
+
+
 def capture_photo(cap):
     for _ in range(5):
         cap.grab()
@@ -353,10 +358,9 @@ def capture_photo(cap):
 
 def handle_button_press(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
     print("[ACTION] Button pressed", flush=True)
-    beeper.click()
 
-    if current_student == "None":
-        print("[WARN] No student selected; button ignored", flush=True)
+    if not has_student(current_student):
+        print("[WARN] No student selected; photo blocked", flush=True)
         update_lcd(lcd, "Choose student", "web")
         beeper.error()
         return
@@ -503,7 +507,7 @@ def main():
 
             if not server_connected:
                 update_lcd(lcd, "System fail", "Code 301")
-            elif current_student == "None":
+            elif not has_student(current_student):
                 update_lcd(lcd, "Choose student", "web")
             elif not button.is_pressed:
                 student_text = current_student[:16]
@@ -516,10 +520,20 @@ def main():
                     print("[ACTION] Double click - next student", flush=True)
                     current_student = next_student_on_server()
                     last_sync = time.time()
-                    if server_connected and current_student != "None":
+                    if not server_connected:
+                        update_lcd(lcd, "System fail", "Code 301")
+                    elif has_student(current_student):
                         update_lcd(lcd, current_student[:16], "Press button")
                     else:
-                        update_lcd(lcd, "System fail", "Code 301")
+                        update_lcd(lcd, "Choose student", "web")
+                    time.sleep(0.3)
+                    continue
+
+                # Single click: photo only if a student is selected
+                if not has_student(current_student):
+                    print("[WARN] No student selected; photo blocked", flush=True)
+                    update_lcd(lcd, "Choose student", "web")
+                    beeper.error()
                     time.sleep(0.3)
                     continue
 
