@@ -4,9 +4,13 @@
 
 Піни (BCM):
   SK6812 / WS2812 data  → GPIO 26  (живлення стрічки — зовнішні 5V, GND спільний)
-  TTP223 Touch Sensor   → GPIO 19  (VCC 3.3V, GND, SIG)
-  Активний баззер       → GPIO 13  (короткі сигнали при дотику / зміні статусу)
+  Фізична кнопка        → GPIO 17  (S→GPIO17, V→3.3V, G→GND; pull_up у коді)
+  Активний баззер       → GPIO 13  (сигнали при кліках / результаті)
   LCD 16x2 I2C          → адреса 0x27 (SDA GPIO 2, SCL GPIO 3)
+
+Керування однією кнопкою:
+  1 клік  — фото + відправка на сервер (учень з LCD)
+  2 кліки — наступний учень
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from RPLCD.i2c import CharLCD
 # ---------------------------------------------------------------------------
 LED_PIN = 26          # SK6812 / WS2812 data (BCM)
 LED_BITBANG_CLOCK_PIN = 16  # фіктивний CLK для bitbang SPI (не підключати)
-TOUCH_PIN = 19        # TTP223 signal (BCM), active-HIGH
+BUTTON_PIN = 17       # фізична кнопка (BCM), active-LOW + pull_up
 BUZZER_PIN = 13       # Active buzzer (BCM)
 LCD_I2C_ADDRESS = 0x27
 
@@ -37,7 +41,7 @@ LED_BRIGHTNESS = 48   # 0–255
 # rpi_ws281x DMA підтримує лише GPIO 10/12/13/18/19/21 — для GPIO 26
 # використовуємо Adafruit NeoPixel_SPI (bitbang).
 
-LONG_PRESS_S = 0.85   # утримування = підтвердження вибору
+DOUBLE_CLICK_WINDOW_S = 0.35  # вікно між кліками для double-click
 SYNC_INTERVAL_S = 2.0
 RESULT_HOLD_S = 4.0
 
@@ -83,7 +87,7 @@ def update_lcd(lcd, line1, line2):
         print(f"[WARN] LCD update failed: {exc}", flush=True)
 
 
-def show_student(lcd, student_name: str, line2: str = "Touch: next/hold"):
+def show_student(lcd, student_name: str, line2: str = "1x photo 2x next"):
     name = student_name if student_name and student_name != "None" else "No student"
     update_lcd(lcd, name[:16], line2[:16])
 
@@ -118,13 +122,13 @@ class Beeper:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def touch(self):
+    def click(self):
         self.beep(0.04, 1)
 
     def next_student(self):
         self.beep(0.05, 2, 0.05)
 
-    def confirm(self):
+    def photo_start(self):
         self.beep(0.1, 1)
 
     def result_ok(self):
@@ -268,9 +272,7 @@ class LedStrip:
     def _show(self):
         if self._pixels is None:
             return
-        if self._backend == "neopixel_spi":
-            self._pixels.show()
-        elif self._backend == "rpi_ws281x":
+        if self._backend in ("neopixel_spi", "rpi_ws281x"):
             self._pixels.show()
 
     def _set_pixel(self, i: int, r: int, g: int, b: int):
@@ -343,7 +345,7 @@ def sync_with_server():
 
 
 def next_student_on_server():
-    """Короткий дотик: наступний учень, синхронізовано з бекендом."""
+    """Подвійний клік: наступний учень, синхронізовано з бекендом."""
     global server_connected
     try:
         response = requests.post(f"{SERVER_URL}/api/pi/next_student", timeout=3)
@@ -354,7 +356,6 @@ def next_student_on_server():
             print(f"[SYNC] next student → {name}", flush=True)
             return name
         print(f"[WARN] next_student status={response.status_code}", flush=True)
-        # fallback: лише sync
         name, _ = sync_with_server()
         return name
     except requests.RequestException as exc:
@@ -380,14 +381,14 @@ def capture_photo(cap):
     return buffer.tobytes()
 
 
-def handle_confirm(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
-    """Довге утримування сенсора — підтвердження вибору та аналіз."""
-    print("[ACTION] Long press — confirm selection", flush=True)
-    beeper.confirm()
+def handle_photo(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
+    """Один клік — знімок і відправка на сервер з ім'ям поточного учня."""
+    print("[ACTION] Single click — capture & upload", flush=True)
+    beeper.photo_start()
 
     if current_student == "None" or not current_student:
-        print("[WARN] No student selected; confirm ignored", flush=True)
-        update_lcd(lcd, "Choose student", "short touch")
+        print("[WARN] No student selected; photo ignored", flush=True)
+        update_lcd(lcd, "Choose student", "2x click next")
         beeper.error()
         return current_student
 
@@ -398,8 +399,8 @@ def handle_confirm(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
         return current_student
 
     leds.set_processing()
-    show_student(lcd, current_student, "Checking AI...")
-    time.sleep(0.3)
+    show_student(lcd, current_student, "Taking photo...")
+    time.sleep(0.2)
 
     photo_bytes = capture_photo(cap)
     if photo_bytes is None:
@@ -459,29 +460,29 @@ def handle_confirm(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
 
 
 # ---------------------------------------------------------------------------
-# Сенсорна кнопка TTP223: короткий дотик / довге утримування
+# Одна фізична кнопка: single click / double click
 # ---------------------------------------------------------------------------
-def wait_touch_gesture(touch: Button, already_pressed: bool = False):
+def wait_button_gesture(button: Button, already_pressed: bool = False) -> str:
     """
-    Блокується до жесту. Повертає 'short' або 'long'.
-    already_pressed=True — дотик уже зафіксовано в головному циклі.
+    Повертає 'single' або 'double'.
+    already_pressed=True — перший клік уже зафіксовано в головному циклі.
     """
     if not already_pressed:
-        touch.wait_for_press()
+        button.wait_for_press()
 
-    if not touch.is_pressed:
-        # дуже короткий дотик встиг відпуститися між перевірками
-        return "short"
+    # дочекатися відпускання першого кліку
+    if button.is_pressed:
+        button.wait_for_release(timeout=3.0)
 
-    t0 = time.monotonic()
-    while touch.is_pressed:
-        if time.monotonic() - t0 >= LONG_PRESS_S:
-            # довге утримування — підтвердження (можна ще не відпускати)
-            return "long"
+    # вікно очікування другого кліку
+    deadline = time.monotonic() + DOUBLE_CLICK_WINDOW_S
+    while time.monotonic() < deadline:
+        if button.is_pressed:
+            button.wait_for_release(timeout=3.0)
+            return "double"
         time.sleep(0.01)
 
-    held = time.monotonic() - t0
-    return "long" if held >= LONG_PRESS_S else "short"
+    return "single"
 
 
 # ---------------------------------------------------------------------------
@@ -526,17 +527,16 @@ def main():
     cap.set(3, 640)
     cap.set(4, 480)
 
-    # TTP223: SIG → GPIO 19, VCC 3.3V, GND; активний рівень HIGH при дотику
+    # Фізична кнопка: S→GPIO 17, V→3.3V, G→GND; внутрішній pull_up (active-LOW)
     try:
-        touch = Button(
-            TOUCH_PIN,
-            pull_up=False,
-            active_state=True,
+        button = Button(
+            BUTTON_PIN,
+            pull_up=True,
             bounce_time=0.05,
         )
-        print(f"[SYSTEM] Touch sensor TTP223 on GPIO {TOUCH_PIN}", flush=True)
+        print(f"[SYSTEM] Button on GPIO {BUTTON_PIN} (pull_up)", flush=True)
     except Exception as exc:
-        print(f"[ERROR] Touch sensor failed: {exc}", flush=True)
+        print(f"[ERROR] Button failed: {exc}", flush=True)
         update_lcd(lcd, "System fail", "Code 102")
         beeper.error()
         leds.stop()
@@ -555,16 +555,15 @@ def main():
                 last_sync = time.time()
                 show_student(lcd, current_student)
 
-            # неблокуюча перевірка дотику з коротким timeout
-            if not touch.is_pressed:
+            if not button.is_pressed:
                 time.sleep(0.05)
                 continue
 
-            beeper.touch()
-            gesture = wait_touch_gesture(touch, already_pressed=True)
+            beeper.click()
+            gesture = wait_button_gesture(button, already_pressed=True)
 
-            if gesture == "short":
-                print("[ACTION] Short touch — next student", flush=True)
+            if gesture == "double":
+                print("[ACTION] Double click — next student", flush=True)
                 beeper.next_student()
                 current_student = next_student_on_server()
                 last_sync = time.time()
@@ -572,14 +571,13 @@ def main():
                 time.sleep(0.25)
                 show_student(lcd, current_student)
             else:
-                current_student = handle_confirm(
+                current_student = handle_photo(
                     lcd, current_student, cap, leds, beeper
                 )
                 last_sync = time.time()
                 show_student(lcd, current_student)
 
-            # антидребезг / уникнення повторного спрацювання
-            while touch.is_pressed:
+            while button.is_pressed:
                 time.sleep(0.05)
             time.sleep(0.15)
 
@@ -589,7 +587,7 @@ def main():
         leds.stop()
         beeper.close()
         try:
-            touch.close()
+            button.close()
         except Exception:
             pass
         cap.release()
