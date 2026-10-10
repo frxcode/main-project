@@ -5,12 +5,8 @@
 Піни (BCM):
   SK6812 / WS2812 data  → GPIO 26  (живлення стрічки — зовнішні 5V, GND спільний)
   Фізична кнопка        → GPIO 17  (S→GPIO17, V→3.3V, G→GND; pull_up у коді)
-  Активний баззер       → GPIO 13  (сигнали при кліках / результаті)
+  Активний баззер       → GPIO 13
   LCD 16x2 I2C          → адреса 0x27 (SDA GPIO 2, SCL GPIO 3)
-
-Керування однією кнопкою:
-  1 клік  — фото + відправка на сервер (учень з LCD)
-  2 кліки — наступний учень
 """
 
 from __future__ import annotations
@@ -28,41 +24,32 @@ from gpiozero import Button, Buzzer
 from RPLCD.i2c import CharLCD
 
 # ---------------------------------------------------------------------------
-# Жорстко закріплена конфігурація пінів / периферії
+# Піни / периферія
 # ---------------------------------------------------------------------------
-LED_PIN = 26          # SK6812 / WS2812 data (BCM)
+LED_PIN = 26
 LED_BITBANG_CLOCK_PIN = 16  # фіктивний CLK для bitbang SPI (не підключати)
-BUTTON_PIN = 17       # фізична кнопка (BCM), active-LOW + pull_up
-BUZZER_PIN = 13       # Active buzzer (BCM)
+BUTTON_PIN = 17
+BUZZER_PIN = 13
 LCD_I2C_ADDRESS = 0x27
 
 LED_COUNT = 16
-LED_BRIGHTNESS = 48   # 0–255
-# rpi_ws281x DMA підтримує лише GPIO 10/12/13/18/19/21 — для GPIO 26
-# використовуємо Adafruit NeoPixel_SPI (bitbang).
+LED_BRIGHTNESS = 48
 
-DOUBLE_CLICK_WINDOW_S = 0.35  # вікно між кліками для double-click
 SYNC_INTERVAL_S = 2.0
 RESULT_HOLD_S = 4.0
 
 SERVER_URL = "http://192.168.1.90:8000"
 
-# ---------------------------------------------------------------------------
-# Глобальний стан LCD (щоб не мигати зайвим clear)
-# ---------------------------------------------------------------------------
 last_line1, last_line2 = "", ""
 server_connected = False
 
 
 class LedMode(Enum):
-    STANDBY = auto()       # райдужний перелив
-    PROCESSING = auto()    # пульс синім (знімок / очікування ШІ)
-    RESULT = auto()        # колір за вердиктом
+    STANDBY = auto()
+    PROCESSING = auto()
+    RESULT = auto()
 
 
-# ---------------------------------------------------------------------------
-# LCD
-# ---------------------------------------------------------------------------
 def update_lcd(lcd, line1, line2):
     global last_line1, last_line2
     l1 = str(line1)[:16]
@@ -87,14 +74,6 @@ def update_lcd(lcd, line1, line2):
         print(f"[WARN] LCD update failed: {exc}", flush=True)
 
 
-def show_student(lcd, student_name: str, line2: str = "1x photo 2x next"):
-    name = student_name if student_name and student_name != "None" else "No student"
-    update_lcd(lcd, name[:16], line2[:16])
-
-
-# ---------------------------------------------------------------------------
-# Баззер
-# ---------------------------------------------------------------------------
 class Beeper:
     def __init__(self, pin: int = BUZZER_PIN):
         self._buzzer = None
@@ -125,12 +104,6 @@ class Beeper:
     def click(self):
         self.beep(0.04, 1)
 
-    def next_student(self):
-        self.beep(0.05, 2, 0.05)
-
-    def photo_start(self):
-        self.beep(0.1, 1)
-
     def result_ok(self):
         self.beep(0.08, 2, 0.07)
 
@@ -152,20 +125,14 @@ class Beeper:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# LED стрічка / кільце (SK6812 / WS2812) на GPIO 26
-# ---------------------------------------------------------------------------
 class LedStrip:
-    """Анімації в окремому потоці: standby / processing / result.
-
-    GPIO 26 не підтримується DMA-драйвером rpi_ws281x, тому використовуємо
-    Adafruit NeoPixel_SPI через bitbang (MOSI = GPIO 26).
-    """
+    """Standby / processing / result на GPIO 26 через bitbang NeoPixel_SPI."""
 
     def __init__(self, pin: int = LED_PIN, count: int = LED_COUNT):
         self.count = count
         self._pixels = None
         self._backend = None
+        self._Color = None
         self._lock = threading.Lock()
         self._mode = LedMode.STANDBY
         self._result_color = (0, 180, 0)
@@ -176,14 +143,20 @@ class LedStrip:
 
     def _init_pixels(self, pin: int, count: int):
         brightness = max(0.05, min(1.0, LED_BRIGHTNESS / 255.0))
+
+        # GPIO 26 не підтримується rpi_ws281x DMA — bitbang SPI (MOSI=D26)
         try:
             import board
-            import bitbangio
             import neopixel_spi as neo_spi
+
+            try:
+                import adafruit_bitbangio as bitbangio
+            except ImportError:
+                import bitbangio  # type: ignore
 
             mosi = getattr(board, f"D{pin}")
             clock = getattr(board, f"D{LED_BITBANG_CLOCK_PIN}")
-            spi = bitbangio.SPI(clock=clock, MOSI=mosi)
+            spi = bitbangio.SPI(clock, MOSI=mosi)
             pixels = neo_spi.NeoPixel_SPI(
                 spi,
                 count,
@@ -191,6 +164,8 @@ class LedStrip:
                 auto_write=False,
                 brightness=brightness,
             )
+            pixels.fill((0, 0, 0))
+            pixels.show()
             self._pixels = pixels
             self._backend = "neopixel_spi"
             print(
@@ -201,7 +176,6 @@ class LedStrip:
         except Exception as exc:
             print(f"[WARN] NeoPixel bitbang init failed: {exc}", flush=True)
 
-        # fallback: rpi_ws281x (лише для GPIO 10/12/13/18/19/21)
         try:
             from rpi_ws281x import PixelStrip, Color  # type: ignore
 
@@ -240,11 +214,11 @@ class LedStrip:
     def set_result(self, ai_percent: int):
         pct = max(0, min(100, int(ai_percent)))
         if pct < 25:
-            color = (0, 220, 40)       # зелений — самостійна робота
+            color = (0, 220, 40)
         elif pct < 75:
-            color = (255, 140, 0)      # жовтий / помаранчевий
+            color = (255, 140, 0)
         else:
-            color = (255, 20, 20)      # червоний — висока ймовірність ШІ
+            color = (255, 20, 20)
         with self._lock:
             self._result_color = color
             self._mode = LedMode.RESULT
@@ -272,8 +246,7 @@ class LedStrip:
     def _show(self):
         if self._pixels is None:
             return
-        if self._backend in ("neopixel_spi", "rpi_ws281x"):
-            self._pixels.show()
+        self._pixels.show()
 
     def _set_pixel(self, i: int, r: int, g: int, b: int):
         if self._pixels is None:
@@ -320,48 +293,23 @@ class LedStrip:
         self._show()
 
 
-# ---------------------------------------------------------------------------
-# Сервер
-# ---------------------------------------------------------------------------
 def sync_with_server():
-    """Повертає (active_student_name, students_list)."""
     global server_connected
     try:
         response = requests.get(f"{SERVER_URL}/api/pi/sync", timeout=2)
         if response.status_code == 200:
             payload = response.json()
-            student_name = str(payload.get("active_student_name", "None"))
-            students = payload.get("students") or []
+            student_name = payload.get("active_student_name", "None")
             server_connected = True
             print(f"[SYNC] active_student_name={student_name}", flush=True)
-            return student_name, students
+            return str(student_name)
         server_connected = False
         print(f"[WARN] Server responded with {response.status_code}", flush=True)
-        return "None", []
+        return "None"
     except requests.RequestException as exc:
         server_connected = False
         print(f"[ERROR] Server disconnected: {exc}", flush=True)
-        return "None", []
-
-
-def next_student_on_server():
-    """Подвійний клік: наступний учень, синхронізовано з бекендом."""
-    global server_connected
-    try:
-        response = requests.post(f"{SERVER_URL}/api/pi/next_student", timeout=3)
-        if response.status_code == 200:
-            payload = response.json()
-            server_connected = True
-            name = str(payload.get("active_student_name", "None"))
-            print(f"[SYNC] next student → {name}", flush=True)
-            return name
-        print(f"[WARN] next_student status={response.status_code}", flush=True)
-        name, _ = sync_with_server()
-        return name
-    except requests.RequestException as exc:
-        print(f"[ERROR] next_student failed: {exc}", flush=True)
-        name, _ = sync_with_server()
-        return name
+        return "None"
 
 
 def capture_photo(cap):
@@ -381,35 +329,33 @@ def capture_photo(cap):
     return buffer.tobytes()
 
 
-def handle_photo(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
-    """Один клік — знімок і відправка на сервер з ім'ям поточного учня."""
-    print("[ACTION] Single click — capture & upload", flush=True)
-    beeper.photo_start()
+def handle_button_press(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
+    print("[ACTION] Button pressed", flush=True)
+    beeper.click()
 
-    if current_student == "None" or not current_student:
-        print("[WARN] No student selected; photo ignored", flush=True)
-        update_lcd(lcd, "Choose student", "2x click next")
+    if current_student == "None":
+        print("[WARN] No student selected; button ignored", flush=True)
+        update_lcd(lcd, "Choose student", "web")
         beeper.error()
-        return current_student
+        return
 
     if not server_connected:
         print("[WARN] Server disconnected; cannot analyze", flush=True)
         update_lcd(lcd, "System fail", "Code 301")
         beeper.error()
-        return current_student
+        return
 
+    print("[ACTION] Checking AI...", flush=True)
     leds.set_processing()
-    show_student(lcd, current_student, "Taking photo...")
-    time.sleep(0.2)
+    update_lcd(lcd, "Checking", "AI")
+    time.sleep(0.5)
 
     photo_bytes = capture_photo(cap)
     if photo_bytes is None:
         update_lcd(lcd, "Analysis fail", "Code 201")
         beeper.error()
         leds.set_standby()
-        return current_student
-
-    show_student(lcd, current_student, "Waiting AI...")
+        return
 
     try:
         response = requests.post(
@@ -425,14 +371,14 @@ def handle_photo(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
             update_lcd(lcd, "Analysis fail", f"Code {response.status_code}")
             beeper.error()
             leds.set_standby()
-            return current_student
+            return
 
         payload = response.json()
         if payload.get("status") != "success":
             update_lcd(lcd, "Analysis fail", "Code 501")
             beeper.error()
             leds.set_standby()
-            return current_student
+            return
 
         pct = int(payload.get("ai_percent", 0))
         pct = max(0, min(100, pct))
@@ -445,55 +391,23 @@ def handle_photo(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
         else:
             beeper.result_bad()
 
-        update_lcd(lcd, current_student[:16], f"{pct}% AI")
+        update_lcd(lcd, "Analysis done", f"{pct}% AI")
         print(f"[RESULT] ai_percent={pct}%", flush=True)
         time.sleep(RESULT_HOLD_S)
         leds.set_standby()
-        show_student(lcd, current_student)
+        update_lcd(lcd, current_student[:16], "Press button")
     except requests.RequestException as exc:
         print(f"[ERROR] Network failure during upload: {exc}", flush=True)
         update_lcd(lcd, "Analysis fail", "Code 500")
         beeper.error()
         leds.set_standby()
 
-    return current_student
 
-
-# ---------------------------------------------------------------------------
-# Одна фізична кнопка: single click / double click
-# ---------------------------------------------------------------------------
-def wait_button_gesture(button: Button, already_pressed: bool = False) -> str:
-    """
-    Повертає 'single' або 'double'.
-    already_pressed=True — перший клік уже зафіксовано в головному циклі.
-    """
-    if not already_pressed:
-        button.wait_for_press()
-
-    # дочекатися відпускання першого кліку
-    if button.is_pressed:
-        button.wait_for_release(timeout=3.0)
-
-    # вікно очікування другого кліку
-    deadline = time.monotonic() + DOUBLE_CLICK_WINDOW_S
-    while time.monotonic() < deadline:
-        if button.is_pressed:
-            button.wait_for_release(timeout=3.0)
-            return "double"
-        time.sleep(0.01)
-
-    return "single"
-
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 def main():
     print("[SYSTEM] Raspberry Pi started", flush=True)
     update_lcd(None, "Welcome", "")
 
     try:
-        # LCD I2C PCF8574 @ 0x27 — SDA GPIO2, SCL GPIO3, VCC 5V, GND
         lcd = CharLCD("PCF8574", LCD_I2C_ADDRESS, port=1, cols=16, rows=2)
         print("[SYSTEM] LCD detected", flush=True)
     except Exception as exc:
@@ -506,14 +420,13 @@ def main():
     leds = LedStrip(LED_PIN, LED_COUNT)
     leds.start()
     leds.set_standby()
-    beeper.beep(0.05, 2, 0.05)
 
     update_lcd(lcd, "Welcome", "")
-    time.sleep(0.8)
-    update_lcd(lcd, "Starting", "system")
     time.sleep(1.0)
+    update_lcd(lcd, "Starting", "system")
+    time.sleep(1.5)
     update_lcd(lcd, "System OK", "Ready")
-    time.sleep(0.8)
+    time.sleep(1.2)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -527,13 +440,8 @@ def main():
     cap.set(3, 640)
     cap.set(4, 480)
 
-    # Фізична кнопка: S→GPIO 17, V→3.3V, G→GND; внутрішній pull_up (active-LOW)
     try:
-        button = Button(
-            BUTTON_PIN,
-            pull_up=True,
-            bounce_time=0.05,
-        )
+        button = Button(BUTTON_PIN, pull_up=True)
         print(f"[SYSTEM] Button on GPIO {BUTTON_PIN} (pull_up)", flush=True)
     except Exception as exc:
         print(f"[ERROR] Button failed: {exc}", flush=True)
@@ -546,41 +454,34 @@ def main():
 
     current_student = "None"
     last_sync = 0.0
+    button_pressed = False
+
+    def on_button_pressed():
+        nonlocal button_pressed
+        button_pressed = True
+
+    button.when_pressed = on_button_pressed
 
     try:
         while True:
             now = time.time()
+
             if now - last_sync >= SYNC_INTERVAL_S:
-                current_student, _ = sync_with_server()
+                current_student = sync_with_server()
                 last_sync = time.time()
-                show_student(lcd, current_student)
 
-            if not button.is_pressed:
-                time.sleep(0.05)
-                continue
+            if current_student == "None":
+                update_lcd(lcd, "Choose student", "web")
+            elif not button_pressed:
+                student_text = current_student[:16]
+                update_lcd(lcd, student_text, "Press button")
 
-            beeper.click()
-            gesture = wait_button_gesture(button, already_pressed=True)
+            if button_pressed:
+                button_pressed = False
+                handle_button_press(lcd, current_student, cap, leds, beeper)
+                time.sleep(0.5)
 
-            if gesture == "double":
-                print("[ACTION] Double click — next student", flush=True)
-                beeper.next_student()
-                current_student = next_student_on_server()
-                last_sync = time.time()
-                show_student(lcd, current_student, "Selected")
-                time.sleep(0.25)
-                show_student(lcd, current_student)
-            else:
-                current_student = handle_photo(
-                    lcd, current_student, cap, leds, beeper
-                )
-                last_sync = time.time()
-                show_student(lcd, current_student)
-
-            while button.is_pressed:
-                time.sleep(0.05)
-            time.sleep(0.15)
-
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("[SYSTEM] Interrupted", flush=True)
     finally:
