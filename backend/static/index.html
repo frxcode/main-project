@@ -322,7 +322,7 @@
                 data.students.forEach(s => {
                     const tile = document.createElement('div');
                     tile.className = 'tile student-tile';
-                    tile.innerHTML = `<div class="tile-avatar">${initials(s.first_name, s.last_name)}</div><div class="tile-name">${s.first_name}<br>${s.last_name}</div>`;
+                    tile.innerHTML = `<div class="tile-avatar">${initials(s.first_name, s.last_name)}</div><div class="tile-name">${s.first_name} ${s.last_name}</div>`;
                     tile.onclick = () => openStudent(s.id, s.first_name, s.last_name);
                     grid.appendChild(tile);
                 });

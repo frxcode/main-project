@@ -82,10 +82,25 @@ def run(args, timeout=30):
 
 
 def is_connected():
-    """Чи є реальний інтернет (NM connectivity або ping)."""
+    """Чи є робоча мережа: NM connectivity, підключений інтерфейс або ping.
+
+    Важливо: локальна мережа без інтернету теж вважається робочою,
+    щоб портал не розривав з'єднання зі шкільним сервером.
+    """
     r = run(["nmcli", "-t", "-f", "CONNECTIVITY", "general"])
     if r.returncode == 0 and r.stdout.strip() == "full":
         return True
+    # Будь-який ethernet/wifi у стані connected (крім нашої власної AP)
+    r = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev"])
+    for line in (r.stdout or "").splitlines():
+        parts = line.split(":")
+        if len(parts) < 4:
+            continue
+        device, dev_type, state, connection = parts[0], parts[1], parts[2], parts[3]
+        if dev_type not in ("wifi", "ethernet"):
+            continue
+        if state == "connected" and connection != AP_CON_NAME:
+            return True
     r = run(["ping", "-c", "1", "-W", "2", "8.8.8.8"], timeout=6)
     return r.returncode == 0
 

@@ -4,7 +4,10 @@ After=NetworkManager.service
 Wants=NetworkManager.service
 
 [Service]
-Type=simple
+# oneshot: залежні сервіси (main.py) стартують лише ПІСЛЯ того,
+# як портал завершиться (мережа налаштована або вже була)
+Type=oneshot
+TimeoutStartSec=infinity
 ExecStart=/usr/bin/python3 /opt/wifi-portal/wifi_portal.py
 Restart=on-failure
 RestartSec=5

@@ -5,7 +5,7 @@ import cv2
 from RPLCD.i2c import CharLCD
 from gpiozero import Button
 
-SERVER_URL = "http://192.168.1.106:8000"
+SERVER_URL = "http://192.168.1.90:8000"
 last_line1, last_line2 = "", ""
 server_connected = False
 
