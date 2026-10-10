@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import colorsys
 import math
+import os
 import threading
 import time
 from enum import Enum, auto
@@ -27,13 +28,16 @@ from RPLCD.i2c import CharLCD
 # Піни / периферія
 # ---------------------------------------------------------------------------
 LED_PIN = 12
-LED_BITBANG_CLOCK_PIN = 16  # фіктивний CLK для bitbang SPI (не підключати)
 BUTTON_PIN = 17
 BUZZER_PIN = 13
 LCD_I2C_ADDRESS = 0x27
 
 LED_COUNT = 16
-LED_BRIGHTNESS = 48
+LED_FREQ_HZ = 800_000
+LED_DMA = 10
+LED_CHANNEL = 0
+LED_BRIGHTNESS = 100
+LED_INVERT = False
 
 SYNC_INTERVAL_S = 2.0
 RESULT_HOLD_S = 4.0
@@ -126,7 +130,7 @@ class Beeper:
 
 
 class LedStrip:
-    """Standby / processing / result на GPIO 26 через bitbang NeoPixel_SPI."""
+    """Standby / processing / result на GPIO 12 через hardware PWM."""
 
     def __init__(self, pin: int = LED_PIN, count: int = LED_COUNT):
         self.count = count
@@ -142,68 +146,33 @@ class LedStrip:
         self._init_pixels(pin, count)
 
     def _init_pixels(self, pin: int, count: int):
-        brightness = max(0.05, min(1.0, LED_BRIGHTNESS / 255.0))
-
-        if pin in (10, 12, 13, 18, 19, 21):
-            try:
-                from rpi_ws281x import PixelStrip, Color  # type: ignore
-
-                self._Color = Color
-                strip = PixelStrip(count, pin, 800_000, 10, False, LED_BRIGHTNESS, 0)
-                strip.begin()
-                self._pixels = strip
-                self._backend = "rpi_ws281x"
-                print(f"[SYSTEM] LED strip on GPIO {pin} via rpi_ws281x, n={count}", flush=True)
-                return
-            except Exception as exc:
-                print(f"[WARN] rpi_ws281x init failed: {exc}", flush=True)
-
-        # Fallback for unsupported DMA pins: bitbang SPI (MOSI=LED_PIN)
         try:
-            import board
-            import neopixel_spi as neo_spi
+            from rpi_ws281x import PixelStrip, Color  # type: ignore
 
-            try:
-                import adafruit_bitbangio as bitbangio
-            except ImportError:
-                import bitbangio  # type: ignore
-
-            mosi = getattr(board, f"D{pin}")
-            clock = getattr(board, f"D{LED_BITBANG_CLOCK_PIN}")
-            spi = bitbangio.SPI(clock, MOSI=mosi)
-            pixels = neo_spi.NeoPixel_SPI(
-                spi,
+            self._Color = Color
+            strip = PixelStrip(
                 count,
-                pixel_order=neo_spi.GRB,
-                auto_write=False,
-                brightness=brightness,
+                pin,
+                LED_FREQ_HZ,
+                LED_DMA,
+                LED_INVERT,
+                LED_BRIGHTNESS,
+                LED_CHANNEL,
             )
-            pixels.fill((0, 0, 0))
-            pixels.show()
-            self._pixels = pixels
-            self._backend = "neopixel_spi"
+            strip.begin()
+            self._pixels = strip
+            self._backend = "rpi_ws281x"
             print(
-                f"[SYSTEM] LED strip on GPIO {pin} via bitbang SPI, n={count}",
+                f"[SYSTEM] LED strip on GPIO {pin} via hardware PWM "
+                f"(channel={LED_CHANNEL}, dma={LED_DMA}, brightness={LED_BRIGHTNESS})",
                 flush=True,
             )
-            return
         except Exception as exc:
-            print(f"[WARN] NeoPixel bitbang init failed: {exc}", flush=True)
-
-        if self._pixels is None:
-            try:
-                from rpi_ws281x import PixelStrip, Color  # type: ignore
-
-                self._Color = Color
-                strip = PixelStrip(count, pin, 800_000, 10, False, LED_BRIGHTNESS, 0)
-                strip.begin()
-                self._pixels = strip
-                self._backend = "rpi_ws281x"
-                print(f"[SYSTEM] LED strip on GPIO {pin} via rpi_ws281x, n={count}", flush=True)
-            except Exception as exc:
-                print(f"[WARN] LED strip unavailable: {exc}", flush=True)
-                self._pixels = None
-                self._backend = None
+            print(f"[ERROR] LED init failed: {exc}", flush=True)
+            if hasattr(os, "geteuid") and os.geteuid() != 0:
+                print("ERROR: Run script with sudo for LED access!", flush=True)
+            self._pixels = None
+            self._backend = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -267,9 +236,7 @@ class LedStrip:
         if self._pixels is None:
             return
         r, g, b = int(r), int(g), int(b)
-        if self._backend == "neopixel_spi":
-            self._pixels[i] = (r, g, b)
-        elif self._backend == "rpi_ws281x":
+        if self._backend == "rpi_ws281x":
             self._pixels.setPixelColor(i, self._Color(r, g, b))
 
     def _clear(self):
