@@ -447,7 +447,39 @@ def pi_sync():
     last_pi_sync = time.time()
     active_id = db.get_active_student_id()
     student = db.get_student(active_id) if active_id is not None else None
-    return {"status": "ok", "active_student_name": full_name(student) if student else "None"}
+    students = db.list_all_students()
+    return {
+        "status": "ok",
+        "active_student_id": active_id,
+        "active_student_name": full_name(student) if student else "None",
+        "students": [{"id": s["id"], "name": full_name(s)} for s in students],
+    }
+
+
+@app.post("/api/pi/next_student")
+def pi_next_student():
+    """Короткий дотик на Pi — наступний учень у списку."""
+    global last_pi_sync
+    last_pi_sync = time.time()
+    students = db.list_all_students()
+    if not students:
+        db.set_active_student_id(None)
+        return {"status": "ok", "active_student_id": None, "active_student_name": "None"}
+
+    active_id = db.get_active_student_id()
+    ids = [s["id"] for s in students]
+    if active_id in ids:
+        next_id = ids[(ids.index(active_id) + 1) % len(ids)]
+    else:
+        next_id = ids[0]
+
+    db.set_active_student_id(next_id)
+    student = db.get_student(next_id)
+    return {
+        "status": "ok",
+        "active_student_id": next_id,
+        "active_student_name": full_name(student) if student else "None",
+    }
 
 
 @app.get("/api/pi/status")

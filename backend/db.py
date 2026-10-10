@@ -273,6 +273,12 @@ def list_students_for_teacher(teacher_id: int) -> list:
         return [_row_to_student(r, _works_for(conn, r["id"])) for r in rows]
 
 
+def list_all_students() -> list:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM students ORDER BY id ASC").fetchall()
+        return [_row_to_student(r, _works_for(conn, r["id"])) for r in rows]
+
+
 def get_student(student_id: int):
     with connect() as conn:
         row = conn.execute("SELECT * FROM students WHERE id = ?", (student_id,)).fetchone()
