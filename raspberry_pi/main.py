@@ -3,7 +3,7 @@
 МАН — Raspberry Pi: перевірка робіт на ШІ.
 
 Піни (BCM):
-  SK6812 / WS2812 data  → GPIO 12  (живлення стрічки — зовнішні 5V, GND спільний)
+  SK6812 / WS2812 data  → GPIO 18  (physical pin 12, живлення стрічки — зовнішні 5V, GND спільний)
   Фізична кнопка        → GPIO 17  (S→GPIO17, V→3.3V, G→GND; pull_up у коді)
   Активний баззер       → GPIO 13
   LCD 16x2 I2C          → адреса 0x27 (SDA GPIO 2, SCL GPIO 3)
@@ -27,7 +27,7 @@ from RPLCD.i2c import CharLCD
 # ---------------------------------------------------------------------------
 # Піни / периферія
 # ---------------------------------------------------------------------------
-LED_PIN = 12
+LED_PIN = 18
 BUTTON_PIN = 17
 BUZZER_PIN = 13
 LCD_I2C_ADDRESS = 0x27
@@ -41,6 +41,7 @@ LED_INVERT = False
 
 SYNC_INTERVAL_S = 2.0
 RESULT_HOLD_S = 4.0
+DOUBLE_CLICK_WINDOW_S = 0.35
 
 SERVER_URL = "http://192.168.1.90:4576"
 
@@ -130,7 +131,7 @@ class Beeper:
 
 
 class LedStrip:
-    """Standby / processing / result на GPIO 12 через hardware PWM."""
+    """Standby / processing / result на GPIO 18 через hardware PWM."""
 
     def __init__(self, pin: int = LED_PIN, count: int = LED_COUNT):
         self.count = count
@@ -294,6 +295,26 @@ def sync_with_server():
         return "None"
 
 
+def next_student_on_server():
+    global server_connected
+    try:
+        response = requests.post(f"{SERVER_URL}/api/pi/next_student", timeout=3)
+        if response.status_code == 200:
+            payload = response.json()
+            server_connected = True
+            student_name = payload.get("active_student_name", "None")
+            print(f"[SYNC] next_student={student_name}", flush=True)
+            return str(student_name)
+
+        server_connected = False
+        print(f"[WARN] next_student responded with {response.status_code}", flush=True)
+        return "None"
+    except requests.RequestException as exc:
+        server_connected = False
+        print(f"[ERROR] next_student failed: {exc}", flush=True)
+        return "None"
+
+
 def capture_photo(cap):
     for _ in range(5):
         cap.grab()
@@ -385,6 +406,23 @@ def handle_button_press(lcd, current_student, cap, leds: LedStrip, beeper: Beepe
         leds.set_standby()
 
 
+def wait_button_gesture(button: Button, already_pressed: bool = False):
+    if not already_pressed:
+        button.wait_for_press()
+
+    if button.is_pressed:
+        button.wait_for_release(timeout=3.0)
+
+    deadline = time.monotonic() + DOUBLE_CLICK_WINDOW_S
+    while time.monotonic() < deadline:
+        if button.is_pressed:
+            button.wait_for_release(timeout=3.0)
+            return "double"
+        time.sleep(0.01)
+
+    return "single"
+
+
 def main():
     print("[SYSTEM] Raspberry Pi started", flush=True)
     update_lcd(None, "Welcome", "")
@@ -436,14 +474,6 @@ def main():
 
     current_student = "None"
     last_sync = 0.0
-    button_pressed = False
-
-    def on_button_pressed():
-        nonlocal button_pressed
-        button_pressed = True
-
-    button.when_pressed = on_button_pressed
-
     try:
         while True:
             now = time.time()
@@ -456,12 +486,24 @@ def main():
                 update_lcd(lcd, "System fail", "Code 301")
             elif current_student == "None":
                 update_lcd(lcd, "Choose student", "web")
-            elif not button_pressed:
+            elif not button.is_pressed:
                 student_text = current_student[:16]
                 update_lcd(lcd, student_text, "Press button")
 
-            if button_pressed:
-                button_pressed = False
+            if button.is_pressed:
+                beeper.click()
+                gesture = wait_button_gesture(button, already_pressed=True)
+                if gesture == "double":
+                    print("[ACTION] Double click - next student", flush=True)
+                    current_student = next_student_on_server()
+                    last_sync = time.time()
+                    if server_connected and current_student != "None":
+                        update_lcd(lcd, current_student[:16], "Press button")
+                    else:
+                        update_lcd(lcd, "System fail", "Code 301")
+                    time.sleep(0.3)
+                    continue
+
                 handle_button_press(lcd, current_student, cap, leds, beeper)
                 time.sleep(0.5)
 
