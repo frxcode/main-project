@@ -25,6 +25,29 @@ UPLOAD_DIR = BASE_DIR / "uploaded_images"
 STATIC_DIR = BASE_DIR / "static"
 PROMPT_FILE = BASE_DIR / "prompt.txt"
 
+
+def _load_env_file(path: Path):
+    """Load KEY=VALUE pairs into os.environ without overriding existing vars."""
+    if not path.exists():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception as exc:
+        print(f"[WARN] Failed to load env file {path}: {exc}", flush=True)
+
+
+# API keys / secrets: ~/.env then backend/.env (never commit secrets)
+_load_env_file(Path.home() / ".env")
+_load_env_file(BASE_DIR / ".env")
+
 SESSION_COOKIE = "session_token"
 SESSION_TTL = 60 * 60 * 24 * 30  # 30 днів
 GMAIL_RE = re.compile(r"^[^\s@]+@gmail\.com$", re.IGNORECASE)
