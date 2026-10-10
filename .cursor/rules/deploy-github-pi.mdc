@@ -1,0 +1,14 @@
+---
+description: Always push to GitHub and reboot Raspberry Pi after code changes
+alwaysApply: true
+---
+
+# Deploy: GitHub + Raspberry Pi reboot
+
+Whenever code is changed in this project (backend/server, raspberry_pi, or any other part):
+
+1. **Commit and push** to `origin/main` on GitHub (`https://github.com/frxcode/main-project.git`) without waiting for the user to ask.
+2. **On the Raspberry Pi** (`project@192.168.1.214`): `git fetch` + `git reset --hard origin/main` (use `GIT_PAGER=cat` / `git --no-pager` to avoid less).
+3. **Reboot the Pi**: `sudo reboot` so autostart picks up the new code.
+
+Do this every time after finishing changes — do not leave updates only on the local machine.
