@@ -366,6 +366,74 @@ def delete_photo(student_id: int = Form(...), photo_url: str = Form(...), teache
 
 
 # ------------------------------- АНАЛІЗ ШІ -------------------------------
+NAME_RECOGNITION_PROMPT = (
+    "Ти розпізнаєш рукописний або друкований текст на фото учнівської роботи. "
+    "Знайди прізвище та ім'я учня на листку (зазвичай зверху). "
+    "Зроби нормалізацію: українською кирилицею, і окремо латиницею (трансліт/англійський варіант). "
+    "Не вигадуй ім'я, якщо його немає на фото. "
+    "Відповідь ТІЛЬКИ JSON без markdown: "
+    '{"first_name":"Ім\'я","last_name":"Прізвище","full_name":"Ім\'я Прізвище",'
+    '"first_name_en":"Name","last_name_en":"Surname","found":true} '
+    "Якщо імені немає: "
+    '{"first_name":"","last_name":"","full_name":"","first_name_en":"","last_name_en":"","found":false}.'
+)
+
+
+def _parse_json_response(text_resp: str) -> dict:
+    text_resp = (text_resp or "").strip()
+    text_resp = re.sub(r"^```(?:json)?\s*", "", text_resp, flags=re.IGNORECASE)
+    text_resp = re.sub(r"\s*```\s*$", "", text_resp, flags=re.IGNORECASE).strip()
+    start, end = text_resp.find("{"), text_resp.rfind("}")
+    if start >= 0 and end > start:
+        text_resp = text_resp[start : end + 1]
+    try:
+        payload = json.loads(text_resp)
+    except json.JSONDecodeError:
+        try:
+            payload = ast.literal_eval(text_resp)
+        except (ValueError, SyntaxError):
+            try:
+                payload = json.loads(text_resp.replace("'", '"'))
+            except Exception:
+                return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def run_name_recognition(target_photo_path) -> dict:
+    """Перший прохід ШІ: витягти ім'я/прізвище з фото роботи."""
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        ai_client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        contents = [
+            NAME_RECOGNITION_PROMPT,
+            "Фото учнівської роботи:",
+            types.Part.from_bytes(data=Path(target_photo_path).read_bytes(), mime_type="image/png"),
+        ]
+        response = ai_client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=contents,
+        )
+        payload = _parse_json_response(response.text or "")
+        return {
+            "found": bool(payload.get("found", bool(payload.get("full_name") or payload.get("last_name")))),
+            "first_name": str(payload.get("first_name", "") or "").strip(),
+            "last_name": str(payload.get("last_name", "") or "").strip(),
+            "full_name": str(payload.get("full_name", "") or "").strip(),
+            "first_name_en": str(payload.get("first_name_en", "") or "").strip(),
+            "last_name_en": str(payload.get("last_name_en", "") or "").strip(),
+        }
+    except Exception as exc:
+        return {
+            "found": False,
+            "first_name": "",
+            "last_name": "",
+            "full_name": "",
+            "first_name_en": "",
+            "last_name_en": "",
+            "error": str(exc),
+        }
+
+
 def run_ai_analysis(target_photo_path, examples_dir):
     example_photos = []
     if examples_dir.exists():
@@ -508,6 +576,72 @@ def pi_next_student():
 @app.get("/api/pi/status")
 def pi_status():
     return {"status": "ok", "is_online": (time.time() - last_pi_sync) < 10}
+
+
+@app.post("/api/pi/recognize_student")
+async def recognize_student(file: UploadFile = File(...)):
+    """Перший прохід: ШІ читає ім'я з фото і шукає учня в БД (без авто-реєстрації)."""
+    global last_pi_sync
+    last_pi_sync = time.time()
+
+    contents = await file.read()
+    if not contents:
+        return {"status": "error", "message": "empty file"}
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = UPLOAD_DIR / f"_recognize_{int(time.time() * 1000)}.png"
+    tmp_path.write_bytes(contents)
+    try:
+        recognized = run_name_recognition(tmp_path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+    if recognized.get("error"):
+        return {"status": "error", "message": recognized["error"], "recognized": recognized}
+
+    if not recognized.get("found"):
+        return {
+            "status": "not_found",
+            "message": "name not found on photo",
+            "recognized": recognized,
+        }
+
+    # Шукаємо лише серед наявних учнів — нові профілі тут не створюємо
+    student = db.find_student_by_parts(
+        first_name=recognized.get("first_name"),
+        last_name=recognized.get("last_name"),
+        full_name=recognized.get("full_name"),
+        prefer_id=db.get_active_student_id(),
+    )
+    if not student:
+        student = db.find_student_by_parts(
+            first_name=recognized.get("first_name_en"),
+            last_name=recognized.get("last_name_en"),
+            full_name=(
+                f"{recognized.get('first_name_en', '')} {recognized.get('last_name_en', '')}".strip()
+                or None
+            ),
+            prefer_id=db.get_active_student_id(),
+        )
+
+    if not student:
+        return {
+            "status": "not_found",
+            "message": "student not in database",
+            "recognized": recognized,
+        }
+
+    db.set_active_student_id(student["id"])
+    return {
+        "status": "success",
+        "student_id": student["id"],
+        "student_name": full_name(student),
+        "recognized": recognized,
+    }
 
 
 @app.post("/upload/")

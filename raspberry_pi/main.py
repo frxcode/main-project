@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-МАН — Raspberry Pi: перевірка робіт на ШІ.
+МАН — Raspberry Pi: двоетапна перевірка робіт на ШІ.
+
+Етап 1 (1-е натискання кнопки): фото → ШІ читає ім'я → пошук у БД → фіолетовий Ready.
+Етап 2 (2-е натискання): повна перевірка на плагіат/ШІ → зелений / жовтий / червоний.
 
 Піни (BCM):
   SK6812 / WS2812 data  → GPIO 18  (physical pin 12, живлення стрічки — зовнішні 5V, GND спільний)
@@ -64,7 +67,8 @@ server_connected = False
 
 class LedMode(Enum):
     STANDBY = auto()
-    PROCESSING = auto()
+    READY = auto()       # учень знайдений, чекаємо 2-е натискання (фіолетовий)
+    PROCESSING = auto()  # другий прохід ШІ (синє пульсування)
     RESULT = auto()
 
 
@@ -144,7 +148,9 @@ class Beeper:
 
 
 class LedStrip:
-    """Standby / processing / result на GPIO 18 через hardware PWM."""
+    """Standby / ready / processing / result на GPIO 18 через hardware PWM."""
+
+    READY_PURPLE = (148, 0, 211)
 
     def __init__(self, pin: int = LED_PIN, count: int = LED_COUNT):
         self.count = count
@@ -206,6 +212,11 @@ class LedStrip:
         with self._lock:
             self._mode = LedMode.STANDBY
 
+    def set_ready(self):
+        """Фіолетовий — Ready to start (учень підтверджений)."""
+        with self._lock:
+            self._mode = LedMode.READY
+
     def set_processing(self):
         with self._lock:
             self._mode = LedMode.PROCESSING
@@ -230,6 +241,8 @@ class LedStrip:
             try:
                 if mode == LedMode.STANDBY:
                     self._draw_rainbow()
+                elif mode == LedMode.READY:
+                    self._draw_solid(self.READY_PURPLE)
                 elif mode == LedMode.PROCESSING:
                     self._draw_pulse_blue()
                 else:
@@ -391,39 +404,117 @@ def capture_photo(cap):
     return buffer.tobytes()
 
 
-def handle_button_press(lcd, current_student, cap, leds: LedStrip, beeper: Beeper):
-    print("[ACTION] Button pressed", flush=True)
-
-    if not has_student(current_student):
-        print("[WARN] No student selected; photo blocked", flush=True)
-        update_lcd(lcd, "Choose student", "web")
-        beeper.error()
-        return
+def handle_stage1_recognize(lcd, cap, leds: LedStrip, beeper: Beeper) -> Optional[str]:
+    """Етап 1: фото → ШІ ім'я → пошук у БД. Повертає ім'я учня або None."""
+    print("[ACTION] Stage 1: recognize student", flush=True)
 
     if not server_connected:
-        print("[WARN] Server disconnected; cannot analyze", flush=True)
+        print("[WARN] Server disconnected; cannot recognize", flush=True)
         update_lcd(lcd, "System fail", "Code 301")
         beeper.error()
-        return
+        return None
 
-    print("[ACTION] Checking AI...", flush=True)
+    update_lcd(lcd, "Reading name", "AI")
     leds.set_processing()
-    update_lcd(lcd, "Checking", "AI")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     photo_bytes = capture_photo(cap)
     if photo_bytes is None:
         update_lcd(lcd, "Analysis fail", "Code 201")
         beeper.error()
         leds.set_standby()
-        return
+        return None
+
+    try:
+        response = requests.post(
+            f"{SERVER_URL}/api/pi/recognize_student",
+            files={"file": ("work.png", photo_bytes, "image/png")},
+            timeout=35,
+        )
+        print(f"[HTTP] recognize status={response.status_code}", flush=True)
+
+        if response.status_code != 200:
+            print(f"[ERROR] Recognize failed: {response.text}", flush=True)
+            update_lcd(lcd, "Name fail", f"Code {response.status_code}")
+            beeper.error()
+            leds.set_standby()
+            return None
+
+        payload = response.json()
+        status = payload.get("status")
+        if status != "success":
+            msg = payload.get("message", "not found")
+            print(f"[WARN] Student not matched: {msg}", flush=True)
+            recognized = payload.get("recognized") or {}
+            hint = (
+                recognized.get("full_name")
+                or f"{recognized.get('last_name', '')} {recognized.get('first_name', '')}".strip()
+            )
+            if hint:
+                update_lcd(lcd, "Not in DB", hint[:16])
+            else:
+                update_lcd(lcd, "Name not found", "try again")
+            beeper.error()
+            time.sleep(2.0)
+            leds.set_standby()
+            return None
+
+        student_name = str(payload.get("student_name", "")).strip()
+        if not has_student(student_name):
+            update_lcd(lcd, "Name fail", "Code 501")
+            beeper.error()
+            leds.set_standby()
+            return None
+
+        leds.set_ready()
+        update_lcd(lcd, student_name[:16], "Press the button")
+        print(f"[READY] student={student_name}", flush=True)
+        beeper.click()
+        return student_name
+    except requests.RequestException as exc:
+        print(f"[ERROR] Network failure during recognize: {exc}", flush=True)
+        update_lcd(lcd, "Analysis fail", "Code 500")
+        beeper.error()
+        leds.set_standby()
+        return None
+
+
+def handle_stage2_analyze(lcd, current_student, cap, leds: LedStrip, beeper: Beeper) -> bool:
+    """Етап 2: повна перевірка роботи. Повертає True якщо цикл завершено (скинути Ready)."""
+    print("[ACTION] Stage 2: full AI check", flush=True)
+
+    if not has_student(current_student):
+        print("[WARN] No student for stage 2", flush=True)
+        update_lcd(lcd, "Choose student", "web")
+        beeper.error()
+        leds.set_standby()
+        return True
+
+    if not server_connected:
+        print("[WARN] Server disconnected; cannot analyze", flush=True)
+        update_lcd(lcd, "System fail", "Code 301")
+        beeper.error()
+        leds.set_standby()
+        return True
+
+    leds.set_processing()
+    update_lcd(lcd, "Checking", "AI")
+    time.sleep(0.3)
+
+    photo_bytes = capture_photo(cap)
+    if photo_bytes is None:
+        update_lcd(lcd, "Analysis fail", "Code 201")
+        beeper.error()
+        leds.set_ready()
+        update_lcd(lcd, current_student[:16], "Press the button")
+        return False
 
     try:
         response = requests.post(
             f"{SERVER_URL}/upload/",
             params={"student_name": current_student},
             files={"file": ("work.png", photo_bytes, "image/png")},
-            timeout=35,
+            timeout=60,
         )
         print(f"[HTTP] upload status={response.status_code}", flush=True)
 
@@ -432,14 +523,14 @@ def handle_button_press(lcd, current_student, cap, leds: LedStrip, beeper: Beepe
             update_lcd(lcd, "Analysis fail", f"Code {response.status_code}")
             beeper.error()
             leds.set_standby()
-            return
+            return True
 
         payload = response.json()
         if payload.get("status") != "success":
             update_lcd(lcd, "Analysis fail", "Code 501")
             beeper.error()
             leds.set_standby()
-            return
+            return True
 
         pct = int(payload.get("ai_percent", 0))
         pct = max(0, min(100, pct))
@@ -457,11 +548,13 @@ def handle_button_press(lcd, current_student, cap, leds: LedStrip, beeper: Beepe
         time.sleep(RESULT_HOLD_S)
         leds.set_standby()
         update_lcd(lcd, current_student[:16], "Press button")
+        return True
     except requests.RequestException as exc:
         print(f"[ERROR] Network failure during upload: {exc}", flush=True)
         update_lcd(lcd, "Analysis fail", "Code 500")
         beeper.error()
         leds.set_standby()
+        return True
 
 
 def wait_button_gesture(button: Button, already_pressed: bool = False):
@@ -549,6 +642,7 @@ def main():
         student_sensor = None
 
     current_student = "None"
+    ready_for_analysis = False  # True після успішного етапу 1 (фіолетовий)
     last_sync = 0.0
     # Стартуємо зі стану "спокій", щоб шум при старті не дав хибний фронт
     sensor_last_stable = SENSOR_IDLE_HIGH
@@ -558,18 +652,26 @@ def main():
             now = time.time()
 
             if now - last_sync >= SYNC_INTERVAL_S:
-                current_student = sync_with_server()
+                synced = sync_with_server()
                 last_sync = time.time()
+                # У Ready не перетираємо учня з етапу 1
+                if not ready_for_analysis:
+                    current_student = synced
 
             if not server_connected:
+                if ready_for_analysis:
+                    ready_for_analysis = False
+                    leds.set_standby()
                 update_lcd(lcd, "System fail", "Code 301")
+            elif ready_for_analysis and has_student(current_student):
+                if not button.is_pressed:
+                    update_lcd(lcd, current_student[:16], "Press the button")
             elif not has_student(current_student):
-                update_lcd(lcd, "Choose student", "web")
+                update_lcd(lcd, "Put paper", "Press button")
             elif not button.is_pressed:
-                student_text = current_student[:16]
-                update_lcd(lcd, student_text, "Press button")
+                update_lcd(lcd, current_student[:16], "Press button")
 
-            # Лише чіткий фронт HIGH→LOW + cooldown (анти-наводки / анти-дребезг)
+            # Steam sensor: наступний учень (скасовує Ready)
             if student_sensor is not None:
                 level = read_steam_sensor_level(student_sensor)
                 if level is not None:
@@ -585,11 +687,12 @@ def main():
                             flush=True,
                         )
                         beeper.click()
+                        ready_for_analysis = False
+                        leds.set_standby()
                         current_student = next_student_on_server()
                         last_sync = time.time()
                         last_sensor_switch = time.time()
                         apply_student_on_lcd(lcd, current_student)
-                        # чекаємо стабільного HIGH (відпускання), інакше не приймаємо новий фронт
                         release_deadline = time.time() + 2.5
                         while time.time() < release_deadline:
                             released = read_steam_sensor_level(student_sensor)
@@ -605,22 +708,28 @@ def main():
                 beeper.click()
                 gesture = wait_button_gesture(button, already_pressed=True)
                 if gesture == "double":
-                    print("[ACTION] Double click - next student", flush=True)
+                    print("[ACTION] Double click - cancel / next student", flush=True)
+                    ready_for_analysis = False
+                    leds.set_standby()
                     current_student = next_student_on_server()
                     last_sync = time.time()
                     apply_student_on_lcd(lcd, current_student)
                     time.sleep(0.3)
                     continue
 
-                # Single click: photo only if a student is selected
-                if not has_student(current_student):
-                    print("[WARN] No student selected; photo blocked", flush=True)
-                    update_lcd(lcd, "Choose student", "web")
-                    beeper.error()
-                    time.sleep(0.3)
-                    continue
-
-                handle_button_press(lcd, current_student, cap, leds, beeper)
+                if ready_for_analysis:
+                    done = handle_stage2_analyze(
+                        lcd, current_student, cap, leds, beeper
+                    )
+                    if done:
+                        ready_for_analysis = False
+                else:
+                    found = handle_stage1_recognize(lcd, cap, leds, beeper)
+                    if found:
+                        current_student = found
+                        ready_for_analysis = True
+                    else:
+                        ready_for_analysis = False
                 time.sleep(0.5)
 
             time.sleep(0.1)

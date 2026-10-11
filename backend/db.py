@@ -304,10 +304,13 @@ def find_student_by_name(name: str, prefer_id: Optional[int] = None):
         rows = conn.execute("SELECT * FROM students").fetchall()
         matches = []
         for r in rows:
+            first = r["first_name"].strip().lower()
+            last = r["last_name"].strip().lower()
             candidates = {
-                r["first_name"].strip().lower(),
-                r["last_name"].strip().lower(),
-                f"{r['first_name']} {r['last_name']}".strip().lower(),
+                first,
+                last,
+                f"{first} {last}",
+                f"{last} {first}",
             }
             if target in candidates:
                 matches.append(r)
@@ -320,6 +323,38 @@ def find_student_by_name(name: str, prefer_id: Optional[int] = None):
                     chosen = r
                     break
         return _row_to_student(chosen, _works_for(conn, chosen["id"]))
+
+
+def find_student_by_parts(
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    full_name: Optional[str] = None,
+    prefer_id: Optional[int] = None,
+):
+    """Гнучкий пошук учня з AI-розпізнавання (без створення нових профілів)."""
+    queries = []
+    for value in (full_name,):
+        if value and str(value).strip():
+            queries.append(str(value).strip())
+    first = (first_name or "").strip()
+    last = (last_name or "").strip()
+    if first and last:
+        queries.extend([f"{first} {last}", f"{last} {first}"])
+    elif first:
+        queries.append(first)
+    elif last:
+        queries.append(last)
+
+    seen = set()
+    for q in queries:
+        key = q.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        student = find_student_by_name(q, prefer_id=prefer_id)
+        if student:
+            return student
+    return None
 
 
 def create_student(teacher_id: int, first_name: str, last_name: str) -> dict:
