@@ -587,6 +587,31 @@ button:active,
     border-color: var(--border-strong);
 }
 
+.example-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+
+.example-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.example-actions button {
+    width: 100%;
+    min-height: 36px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.25;
+}
+
+.modal-grid.no-result {
+    grid-template-columns: 1fr;
+}
+
 .empty-note {
     grid-column: 1 / -1;
     color: var(--text-muted);

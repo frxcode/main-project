@@ -152,7 +152,7 @@
                     <img id="modal-img" class="modal-img" src="" alt="Фото роботи">
                 </div>
 
-                <div class="ai-result-box" style="min-height: 100%;">
+                <div class="ai-result-box" id="modal-result" style="min-height: 100%;">
                     <div class="ai-title">Ймовірність штучного інтелекту</div>
                     <div class="ai-percent-display" id="modal-percent">0%</div>
                     <div class="progress-bar-container">
@@ -168,10 +168,14 @@
                 </div>
             </div>
 
-            <div class="modal-actions" id="modal-actions">
+            <div class="modal-actions" id="verifier-actions">
                 <button class="btn-primary" id="btn-analyze" onclick="runManualAnalysis()">Запустити аналіз ШІ</button>
                 <button class="btn-secondary" onclick="moveToExamples()">Завантажити в Приклади</button>
                 <button class="btn-danger" onclick="deleteCurrentPhoto()">Видалити з перевірника</button>
+            </div>
+            <div class="modal-actions hidden" id="example-actions">
+                <button class="btn-secondary" onclick="moveExampleToVerifier()">Перенести на перевірник</button>
+                <button class="btn-danger" onclick="deleteExamplePhoto()">Видалити з еталону</button>
             </div>
         </div>
     </div>
@@ -461,8 +465,34 @@
             photos.forEach(url => {
                 const img = document.createElement('img');
                 img.src = url;
+                img.alt = isVerifier ? 'Фото перевірки' : 'Еталон';
                 img.onclick = () => openPhotoModal(url, isVerifier);
-                gallery.appendChild(img);
+
+                if (isVerifier) {
+                    gallery.appendChild(img);
+                    return;
+                }
+
+                const card = document.createElement('div');
+                card.className = 'example-card';
+                const actions = document.createElement('div');
+                actions.className = 'example-actions';
+
+                const moveBtn = document.createElement('button');
+                moveBtn.type = 'button';
+                moveBtn.className = 'btn-secondary';
+                moveBtn.textContent = 'Перенести на перевірник';
+                moveBtn.onclick = () => moveExampleToVerifier(url);
+
+                const deleteBtn = document.createElement('button');
+                deleteBtn.type = 'button';
+                deleteBtn.className = 'btn-danger';
+                deleteBtn.textContent = 'Видалити з еталону';
+                deleteBtn.onclick = () => deleteExamplePhoto(url);
+
+                actions.append(moveBtn, deleteBtn);
+                card.append(img, actions);
+                gallery.appendChild(card);
             });
         }
 
@@ -512,8 +542,13 @@
             document.getElementById('modal-bar').style.width = '0%';
             document.getElementById('modal-desc').textContent = 'Підвантажую результат перевірки...';
             document.getElementById('modal-timestamp').textContent = '—';
-            document.getElementById('modal-actions').style.display = isVerifier ? 'flex' : 'none';
+            document.getElementById('verifier-actions').classList.toggle('hidden', !isVerifier);
+            document.getElementById('example-actions').classList.toggle('hidden', isVerifier);
+            document.getElementById('modal-result').classList.toggle('hidden', !isVerifier);
+            document.querySelector('#photo-modal .modal-grid').classList.toggle('no-result', !isVerifier);
             document.getElementById('photo-modal').classList.remove('hidden');
+
+            if (!isVerifier) return;
 
             try {
                 const filename = url.split('/').pop();
@@ -598,6 +633,44 @@
                 await loadStudentFiles();
             } catch (error) {
                 alert(`Не вдалося видалити фото: ${error.message}`);
+            }
+        }
+
+        async function moveExampleToVerifier(photoUrl) {
+            const url = photoUrl || selectedPhotoUrl;
+            if (!url) return;
+            if (!confirm('Перенести це фото з еталону на перевірник?')) return;
+
+            const formData = new FormData();
+            formData.append('student_id', currentStudentId);
+            formData.append('photo_url', url);
+
+            try {
+                const data = await fetchJson('/api/photo/move-to-verifier', { method: 'POST', body: formData });
+                if (data && data.status === 'error') throw new Error(data.message || 'Помилка перенесення');
+                closePhotoModal();
+                await loadStudentFiles();
+            } catch (error) {
+                alert(`Не вдалося перенести фото: ${error.message}`);
+            }
+        }
+
+        async function deleteExamplePhoto(photoUrl) {
+            const url = photoUrl || selectedPhotoUrl;
+            if (!url) return;
+            if (!confirm('Видалити це фото з еталону?')) return;
+
+            const formData = new FormData();
+            formData.append('student_id', currentStudentId);
+            formData.append('photo_url', url);
+
+            try {
+                const data = await fetchJson('/api/photo/delete', { method: 'POST', body: formData });
+                if (data && data.status === 'error') throw new Error(data.message || 'Помилка видалення');
+                closePhotoModal();
+                await loadStudentFiles();
+            } catch (error) {
+                alert(`Не вдалося видалити фото з еталону: ${error.message}`);
             }
         }
 

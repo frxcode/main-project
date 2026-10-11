@@ -426,19 +426,57 @@ async def upload_to_folder(
     return {"status": "success", "filename": save_path.name}
 
 
+def _photo_file(student, photo_url: str, folder: Optional[str] = None):
+    """Resolve a student photo from its public URL. Filename only, inside that folder."""
+    filename = Path(str(photo_url or "")).name
+    if not filename or filename in {".", ".."} or filename.startswith("."):
+        return None
+    verifier_dir, examples_dir = student_dirs(student)
+    url = str(photo_url).replace("\\", "/")
+    if folder is None:
+        if "/examples/" in url:
+            folder = "examples"
+        elif "/verifier/" in url:
+            folder = "verifier"
+    if folder == "examples":
+        return examples_dir / filename
+    if folder == "verifier":
+        return verifier_dir / filename
+    return None
+
+
 @app.post("/api/photo/move-to-examples")
 def move_to_examples(student_id: int = Form(...), photo_url: str = Form(...), teacher=Depends(require_teacher)):
     student = db.get_student_for_teacher(student_id, teacher["id"])
     if not student:
         return {"status": "error", "message": "student not found"}
 
-    verifier_dir, examples_dir = student_dirs(student)
-    filename = Path(photo_url).name
-    src, dst = verifier_dir / filename, examples_dir / filename
-    if src.exists():
-        shutil.move(str(src), str(dst))
-        return {"status": "success"}
-    return {"status": "error", "message": "source photo not found"}
+    _verifier_dir, examples_dir = student_dirs(student)
+    src = _photo_file(student, photo_url, "verifier")
+    if src is None or not src.exists():
+        return {"status": "error", "message": "source photo not found"}
+    dst = examples_dir / src.name
+    if dst.exists():
+        dst = examples_dir / f"{src.stem}_{datetime.now().strftime('%H%M%S%f')}{src.suffix}"
+    shutil.move(str(src), str(dst))
+    return {"status": "success"}
+
+
+@app.post("/api/photo/move-to-verifier")
+def move_to_verifier(student_id: int = Form(...), photo_url: str = Form(...), teacher=Depends(require_teacher)):
+    student = db.get_student_for_teacher(student_id, teacher["id"])
+    if not student:
+        return {"status": "error", "message": "student not found"}
+
+    verifier_dir, _examples_dir = student_dirs(student)
+    src = _photo_file(student, photo_url, "examples")
+    if src is None or not src.exists():
+        return {"status": "error", "message": "source photo not found"}
+    dst = verifier_dir / src.name
+    if dst.exists():
+        dst = verifier_dir / f"{src.stem}_{datetime.now().strftime('%H%M%S%f')}{src.suffix}"
+    shutil.move(str(src), str(dst))
+    return {"status": "success"}
 
 
 @app.post("/api/photo/delete")
@@ -447,10 +485,15 @@ def delete_photo(student_id: int = Form(...), photo_url: str = Form(...), teache
     if not student:
         return {"status": "error", "message": "student not found"}
 
-    filename = Path(photo_url).name
+    target = _photo_file(student, photo_url)
+    if target is not None and target.exists():
+        target.unlink()
+        return {"status": "success"}
+
+    filename = Path(str(photo_url or "")).name
     for sub_dir in student_dirs(student):
         p = sub_dir / filename
-        if p.exists():
+        if filename and p.exists():
             p.unlink()
             return {"status": "success"}
     return {"status": "error", "message": "photo not found"}
