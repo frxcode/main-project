@@ -17,6 +17,7 @@ from google import genai
 from google.genai import types
 
 import db
+import translit
 
 app = FastAPI(title="MAN AI Checker API")
 
@@ -247,12 +248,63 @@ def get_students(teacher=Depends(require_teacher)):
     return {"active_student_id": active_id, "students": students}
 
 
-@app.post("/api/students/add")
-def add_student(first_name: str = Form(...), last_name: str = Form(...), teacher=Depends(require_teacher)):
+def latin_display_name(student) -> str:
+    """Short Latin name for the 16-character LCD."""
+    if not student:
+        return ""
+    first, last, _changed = translit.latinize_parts(student["first_name"], student["last_name"])
+    return f"{last} {first}".strip()[:16]
+
+
+def ensure_latin_name(first_name: str, last_name: str) -> tuple[str, str, bool]:
+    """Transliterate a Cyrillic name with AI, then the local table."""
     first = db.normalize_name_part(first_name)
     last = db.normalize_name_part(last_name)
-    if not first or not last:
+    if not (translit.has_cyrillic(first) or translit.has_cyrillic(last)):
+        return first, last, False
+    ai_name = ai_transliterate_name(first, last)
+    if ai_name:
+        return ai_name[0], ai_name[1], True
+    latin_first, latin_last, changed = translit.latinize_parts(first, last)
+    return latin_first, latin_last, changed
+
+
+def ai_transliterate_name(first_name: str, last_name: str):
+    """Ask the model for a Latin spelling. None when AI is unavailable."""
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        ai_client = genai.Client(api_key=api_key)
+        response = ai_client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=[
+                "Transliterate this personal name from Cyrillic into Latin ASCII letters. "
+                "Use a common English spelling. Return ONLY JSON: "
+                '{"first_name_en":"Ivan","last_name_en":"Petrenko"}. No markdown.',
+                f"first_name: {first_name}\nlast_name: {last_name}",
+            ],
+        )
+        payload = _parse_json_response(response.text or "")
+        first_en = db.normalize_name_part(payload.get("first_name_en", ""))
+        last_en = db.normalize_name_part(payload.get("last_name_en", ""))
+        if translit.is_latin_name(first_en) and translit.is_latin_name(last_en):
+            return first_en, last_en
+    except Exception as exc:
+        print(f"[WARN] name transliteration AI failed: {exc}", flush=True)
+    return None
+
+
+@app.post("/api/students/add")
+def add_student(first_name: str = Form(...), last_name: str = Form(...), teacher=Depends(require_teacher)):
+    original_first = db.normalize_name_part(first_name)
+    original_last = db.normalize_name_part(last_name)
+    if not original_first or not original_last:
         raise HTTPException(status_code=400, detail="first_name and last_name are required")
+
+    first, last, transliterated = ensure_latin_name(original_first, original_last)
+    if not first or not last:
+        raise HTTPException(status_code=400, detail="Could not transliterate the student name")
 
     try:
         student = db.create_student(teacher["id"], first, last)
@@ -265,11 +317,22 @@ def add_student(first_name: str = Form(...), last_name: str = Form(...), teacher
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     student_dirs(student)
+    original_name = f"{original_first} {original_last}".strip()
+    stored_name = full_name(student)
+    warning = None
+    if transliterated and original_name.lower() != stored_name.lower():
+        warning = (
+            "Ім'я автоматично переведено латиницею для сумісності системи: "
+            f"{original_name} → {stored_name}"
+        )
     return {
         "status": "success",
         "student": student,
         "student_id": student["id"],
-        "student_name": full_name(student),
+        "student_name": stored_name,
+        "transliterated": bool(warning),
+        "original_name": original_name,
+        "warning": warning,
     }
 
 
@@ -307,7 +370,23 @@ async def select_student(
         return {"status": "error", "message": "student not found"}
 
     db.set_active_student_id(student["id"])
-    return {"status": "success", "student_id": student["id"], "student_name": full_name(student)}
+    return {
+        "status": "success",
+        "student_id": student["id"],
+        "student_name": full_name(student),
+        "display_name": latin_display_name(student),
+    }
+
+
+@app.post("/api/students/clear")
+def clear_selected_student(teacher=Depends(require_teacher)):
+    """Teacher cleared the stand. The LCD returns to the standby message."""
+    active_id = db.get_active_student_id()
+    if active_id is not None:
+        student = db.get_student_for_teacher(active_id, teacher["id"])
+        if student or not db.get_student(active_id):
+            db.set_active_student_id(None)
+    return {"status": "success", "active_student_id": None, "display_name": ""}
 
 
 @app.get("/api/students/{student_id}/files")
@@ -565,6 +644,7 @@ def pi_sync():
         "status": "ok",
         "active_student_id": active_id,
         "active_student_name": full_name(student) if student else "None",
+        "display_name": latin_display_name(student),
         "students": [{"id": s["id"], "name": full_name(s)} for s in students],
     }
 
@@ -623,14 +703,21 @@ async def recognize_student(file: UploadFile = File(...)):
     if not recognized.get("found"):
         return {"status": "not_found", "message": "name not found on photo", "recognized": recognized}
 
+    source_first = recognized.get("first_name") or recognized.get("first_name_en") or ""
+    source_last = recognized.get("last_name") or recognized.get("last_name_en") or ""
+    if translit.has_cyrillic(source_first) or translit.has_cyrillic(source_last):
+        ai_name = ai_transliterate_name(source_first, source_last)
+        if ai_name:
+            recognized["first_name_en"], recognized["last_name_en"] = ai_name
+            recognized["display_name"] = f"{ai_name[1]} {ai_name[0]}".strip()
+    recognized = translit.prepare_for_match(recognized)
     student = db.find_student_by_parts(
-        first_name=recognized.get("first_name"),
-        last_name=recognized.get("last_name"),
-        full_name=recognized.get("full_name"),
-    ) or db.find_student_by_parts(
         first_name=recognized.get("first_name_en"),
         last_name=recognized.get("last_name_en"),
-        full_name=f"{recognized.get('first_name_en', '')} {recognized.get('last_name_en', '')}".strip() or None,
+        full_name=recognized.get("display_name"),
+    ) or db.find_student_by_latin(
+        recognized.get("first_name_en") or "",
+        recognized.get("last_name_en") or "",
     )
     if not student:
         return {"status": "not_found", "message": "student not in database", "recognized": recognized}

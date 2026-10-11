@@ -7,6 +7,8 @@
 import json
 import sqlite3
 import time
+
+import translit
 from pathlib import Path
 from typing import Optional
 
@@ -458,6 +460,24 @@ def find_student_by_parts(
                 return exact
         student = find_student_by_name(normalize_name_part(str(full_name)), prefer_id=prefer_id)
         if student:
+            return student
+    return None
+
+
+def find_student_by_latin(first_name: str, last_name: str):
+    """Match a Latin name against stored names, transliterating Cyrillic rows."""
+    first, last, _changed = translit.latinize_parts(first_name, last_name)
+    if not first or not last:
+        return None
+    target_keys = {
+        full_name_key(first, last),
+        full_name_key(last, first),
+    }
+    for student in list_all_students():
+        stored_first, stored_last, _stored_changed = translit.latinize_parts(
+            student["first_name"], student["last_name"]
+        )
+        if full_name_key(stored_first, stored_last) in target_keys:
             return student
     return None
 

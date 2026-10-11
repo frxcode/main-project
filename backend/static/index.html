@@ -65,8 +65,24 @@
             <div id="main-view">
                 <div class="page-head">
                     <h1>Учні</h1>
-                    <p>Оберіть учня, щоб переглянути роботи та результати перевірки ШІ.</p>
+                    <p>Оберіть учня для стенду або відкрийте картку, щоб переглянути роботи.</p>
                 </div>
+                <div class="name-warning hidden" id="name-warning" role="status"></div>
+                <section class="stand-select" aria-label="Ручний вибір учня">
+                    <div class="stand-select-copy">
+                        <div class="stand-kicker">Обраний учень для стенду</div>
+                        <div class="stand-current" id="selected-student-label">Нікого не обрано</div>
+                        <p class="stand-hint">Цей учень одразу з’являється на Raspberry Pi і на LCD. Якщо нікого не обрано, екран показує «Choose student in web or scan document».</p>
+                    </div>
+                    <div class="stand-select-controls">
+                        <label for="manual-student-select">Список учнів</label>
+                        <select id="manual-student-select"></select>
+                        <div class="stand-actions">
+                            <button type="button" class="btn-primary" onclick="selectStudentForStand()">Обрати учня</button>
+                            <button type="button" class="btn-secondary" onclick="clearStudentSelection()">Скинути</button>
+                        </div>
+                    </div>
+                </section>
                 <div class="grid" id="students-grid"></div>
             </div>
 
@@ -175,6 +191,7 @@
 
     <script>
         let currentStudentId = null;
+        let activeStudentId = null;
         let selectedPhotoUrl = null;
         let lastLatestResultSignature = null;
 
@@ -330,10 +347,18 @@
                 data.students.forEach(s => {
                     const tile = document.createElement('div');
                     tile.className = 'tile student-tile';
-                    tile.innerHTML = `<div class="tile-avatar">${initials(s.first_name, s.last_name)}</div><div class="tile-name">${s.first_name} ${s.last_name}</div>`;
+                    tile.dataset.id = s.id;
+                    if (Number(s.id) === Number(data.active_student_id)) tile.classList.add('is-active');
+                    tile.innerHTML = `<div class="tile-avatar">${initials(s.first_name, s.last_name)}</div><div class="tile-name">${escapeHtml(s.first_name)} ${escapeHtml(s.last_name)}</div><button type="button" class="tile-select">Обрати</button>`;
                     tile.onclick = () => openStudent(s.id, s.first_name, s.last_name);
+                    tile.querySelector('.tile-select').onclick = (event) => {
+                        event.stopPropagation();
+                        chooseStudent(s.id);
+                    };
                     grid.appendChild(tile);
                 });
+                fillStudentSelect(document.getElementById('manual-student-select'), data.students, data.active_student_id);
+                applyActiveStudent(data);
 
                 const addTile = document.createElement('div');
                 addTile.className = 'tile add-tile';
@@ -619,12 +644,8 @@
                 const select = document.getElementById('pi-student-select');
                 select.innerHTML = '';
 
-                data.students.forEach(s => {
-                    const opt = document.createElement('option');
-                    opt.value = s.id;
-                    opt.textContent = `${s.first_name} ${s.last_name}`;
-                    select.appendChild(opt);
-                });
+                fillStudentSelect(select, data.students, data.active_student_id);
+                if (data.active_student_id) select.value = String(data.active_student_id);
             } catch (error) {
                 alert(`Помилка завантаження учнів для Raspberry Pi: ${error.message}`);
             }
@@ -683,19 +704,104 @@
             formData.append('last_name', lastName);
 
             try {
-                await fetchJson('/api/students/add', { method: 'POST', body: formData });
+                const created = await fetchJson('/api/students/add', { method: 'POST', body: formData });
                 await loadMainView();
+                if (created && created.warning) showNameWarning(created.warning);
             } catch (error) {
                 alert(`Не вдалося створити учня: ${error.message}`);
+            }
+        }
+
+        function escapeHtml(value) {
+            return String(value || '').replace(/[&<>"']/g, (ch) => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[ch]));
+        }
+
+        function fillStudentSelect(select, students, activeId) {
+            if (!select) return;
+            select.innerHTML = '<option value="">— оберіть учня —</option>';
+            (students || []).forEach(s => {
+                const opt = document.createElement('option');
+                opt.value = s.id;
+                opt.textContent = `${s.first_name} ${s.last_name}`;
+                select.appendChild(opt);
+            });
+            select.value = activeId ? String(activeId) : '';
+        }
+
+        function applyActiveStudent(data) {
+            activeStudentId = data ? data.active_student_id : null;
+            const label = document.getElementById('selected-student-label');
+            const chosen = ((data && data.students) || []).find(s => Number(s.id) === Number(activeStudentId));
+            if (label) {
+                label.textContent = chosen
+                    ? `${chosen.first_name} ${chosen.last_name}`
+                    : 'Нікого не обрано';
+            }
+            document.querySelectorAll('.student-tile').forEach(tile => {
+                tile.classList.toggle('is-active', Number(tile.dataset.id) === Number(activeStudentId));
+            });
+        }
+
+        function showNameWarning(message) {
+            const box = document.getElementById('name-warning');
+            if (!box) return;
+            box.textContent = message;
+            box.classList.remove('hidden');
+        }
+
+        async function chooseStudent(studentId) {
+            const formData = new FormData();
+            formData.append('student_id', studentId);
+            const response = await fetchJson('/api/students/select', { method: 'POST', body: formData });
+            if (!response || response.status !== 'success') {
+                throw new Error((response && response.message) || 'Не вдалося обрати учня');
+            }
+            await loadMainView();
+            const status = document.getElementById('pi-status');
+            if (status) {
+                status.classList.remove('hidden');
+                status.textContent = `Обрано: ${response.student_name}. LCD: ${response.display_name || response.student_name}`;
+            }
+        }
+
+        async function selectStudentForStand() {
+            const studentId = document.getElementById('manual-student-select').value;
+            if (!studentId) {
+                alert('Оберіть учня зі списку');
+                return;
+            }
+            try {
+                await chooseStudent(studentId);
+            } catch (error) {
+                alert(error.message);
+            }
+        }
+
+        async function clearStudentSelection() {
+            try {
+                await fetchJson('/api/students/clear', { method: 'POST' });
+                await loadMainView();
+            } catch (error) {
+                alert(`Не вдалося скинути вибір: ${error.message}`);
             }
         }
 
         /* ============================ ІНІЦІАЛІЗАЦІЯ ============================ */
         initAuth();
 
-        setInterval(() => {
+        setInterval(async () => {
             if (!isAuthenticated()) return;
             pingRaspberryPi();
+            if (!document.getElementById('main-view').classList.contains('hidden')) {
+                try {
+                    const data = await fetchJson('/api/students');
+                    applyActiveStudent(data);
+                } catch (error) {
+                    console.warn('Stand selection sync failed:', error);
+                }
+            }
         }, 3000);
 
         setInterval(async () => {

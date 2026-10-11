@@ -85,8 +85,21 @@ def update_lcd(lcd, line1, line2=""):
         print(f"[WARN] LCD update failed: {exc}", flush=True)
 
 
+IDLE_LCD_MESSAGE = "Choose student in web or scan document"
+_idle_phase = 0
+_idle_tick = 0.0
+
+
 def show_idle_lcd(lcd):
-    update_lcd(lcd, "Choose student", "web or scan doc")
+    """Scroll the full standby sentence across the 16x2 LCD."""
+    global _idle_phase, _idle_tick
+    now = time.time()
+    padded = IDLE_LCD_MESSAGE + "    "
+    if now - _idle_tick >= 0.4:
+        _idle_phase = (_idle_phase + 1) % len(padded)
+        _idle_tick = now
+    window = (padded + padded)[_idle_phase : _idle_phase + 32]
+    update_lcd(lcd, window[:16], window[16:32])
 
 
 def use_software_gpio() -> None:
@@ -315,14 +328,33 @@ class LedStrip:
 
 
 def ping_server() -> bool:
+    connected, _active_id, _display = pull_server_selection()
+    return connected
+
+
+def pull_server_selection() -> tuple[bool, Optional[int], str]:
+    """Read the student the teacher selected in the web dashboard."""
     global server_connected
     try:
         response = requests.get(f"{SERVER_URL}/api/pi/sync", timeout=2)
-        server_connected = response.status_code == 200
-        return server_connected
     except requests.RequestException:
         server_connected = False
-        return False
+        return False, None, ""
+    server_connected = response.status_code == 200
+    if not server_connected:
+        return False, None, ""
+    data = response.json()
+    raw_id = data.get("active_student_id")
+    if raw_id is None:
+        return True, None, ""
+    try:
+        active_id = int(raw_id)
+    except (TypeError, ValueError):
+        return True, None, ""
+    display = str(data.get("display_name") or data.get("active_student_name") or "").strip()
+    if display == "None":
+        display = ""
+    return True, active_id, display[:16]
 
 
 def clear_session_on_server() -> None:
@@ -484,19 +516,31 @@ def main():
         cap.release()
         return
 
-    clear_session_on_server()
-    ping_server()
-    student_id, display_name = reset_session(lcd, leds)
-    ready = False
-    last_sync = 0.0
+    connected, active_id, active_name = pull_server_selection()
+    if connected and active_id is not None and active_name:
+        student_id, display_name, ready = active_id, active_name, True
+        leds.set_ready()
+        update_lcd(lcd, display_name[:16], "Press button")
+    else:
+        student_id, display_name = reset_session(lcd, leds)
+        ready = False
+    last_sync = time.time()
     print("[SYSTEM] Idle", flush=True)
 
     try:
         while True:
             now = time.time()
             if now - last_sync >= SYNC_INTERVAL_S:
-                ping_server()
+                connected, active_id, active_name = pull_server_selection()
                 last_sync = now
+                if connected and active_id != student_id:
+                    if active_id is None or not active_name:
+                        student_id, display_name = reset_session(lcd, leds)
+                        ready = False
+                    else:
+                        student_id, display_name, ready = active_id, active_name, True
+                        leds.set_ready()
+                        update_lcd(lcd, display_name[:16], "Press button")
 
             if not server_connected:
                 if ready:
