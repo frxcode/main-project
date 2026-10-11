@@ -8,7 +8,6 @@
 Піни (BCM):
   SK6812 / WS2812 data  → GPIO 18  (physical pin 12, живлення стрічки — зовнішні 5V, GND спільний)
   Фізична кнопка        → GPIO 17  (S→GPIO17, V→3.3V, G→GND; pull_up у коді)
-  Keyestudio Steam/Rain → GPIO 19  (S→GPIO19, V→3.3V, G→GND; DO active-LOW)
   Активний баззер       → GPIO 13
   LCD 16x2 I2C          → адреса 0x27 (SDA GPIO 2, SCL GPIO 3)
 """
@@ -25,7 +24,7 @@ from typing import Optional
 
 import cv2
 import requests
-from gpiozero import Button, DigitalInputDevice, Buzzer
+from gpiozero import Button, Buzzer
 from RPLCD.i2c import CharLCD
 
 # ---------------------------------------------------------------------------
@@ -33,15 +32,8 @@ from RPLCD.i2c import CharLCD
 # ---------------------------------------------------------------------------
 LED_PIN = 18
 BUTTON_PIN = 17
-STUDENT_SENSOR_PIN = 19  # Keyestudio Steam/Rain DO → перемикання учня
 BUZZER_PIN = 13
 LCD_I2C_ADDRESS = 0x27
-# Keyestudio DO: спокій = HIGH (підтяжка PUD_UP), дотик/волога = LOW
-SENSOR_SAMPLE_COUNT = 5      # скільки разів зчитати пін для стабільності
-SENSOR_SAMPLE_GAP_S = 0.01   # пауза між зчитуваннями (debounce)
-SENSOR_STABLE_NEED = 4       # мінімум однакових зразків зі SAMPLE_COUNT
-SENSOR_COOLDOWN_S = 1.0      # пауза після успішного перемикання
-SENSOR_IDLE_HIGH = 1         # спокійний рівень після pull-up
 
 LED_COUNT = 16
 LED_FREQ_HZ = 800_000
@@ -355,24 +347,6 @@ def next_student_on_server():
         return "None"
 
 
-def read_steam_sensor_level(sensor: DigitalInputDevice) -> Optional[int]:
-    """
-    Стабільне зчитування DO з внутрішньою підтяжкою (PUD_UP).
-    Повертає 0/1 лише якщо більшість зразків збігаються, інакше None (шум).
-    """
-    samples = []
-    for _ in range(SENSOR_SAMPLE_COUNT):
-        samples.append(1 if sensor.value else 0)
-        time.sleep(SENSOR_SAMPLE_GAP_S)
-    highs = sum(samples)
-    lows = SENSOR_SAMPLE_COUNT - highs
-    if highs >= SENSOR_STABLE_NEED:
-        return 1
-    if lows >= SENSOR_STABLE_NEED:
-        return 0
-    return None
-
-
 def apply_student_on_lcd(lcd, student_name: str):
     if not server_connected:
         update_lcd(lcd, "System fail", "Code 301")
@@ -623,30 +597,9 @@ def main():
         cap.release()
         return
 
-    # Keyestudio Steam/Rain: V→3.3V, G→GND, DO/S→GPIO 19
-    # pull_up=True == GPIO.PUD_UP: спокій HIGH, дотик/волога тягне DO в LOW
-    student_sensor = None
-    try:
-        student_sensor = DigitalInputDevice(
-            STUDENT_SENSOR_PIN,
-            pull_up=True,  # внутрішній PUD_UP проти наводок
-            bounce_time=0.15,
-        )
-        print(
-            f"[SYSTEM] Keyestudio Steam sensor GPIO {STUDENT_SENSOR_PIN} "
-            f"(PUD_UP, edge HIGH→LOW)",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"[WARN] Steam sensor unavailable: {exc}", flush=True)
-        student_sensor = None
-
     current_student = "None"
     ready_for_analysis = False  # True після успішного етапу 1 (фіолетовий)
     last_sync = 0.0
-    # Стартуємо зі стану "спокій", щоб шум при старті не дав хибний фронт
-    sensor_last_stable = SENSOR_IDLE_HIGH
-    last_sensor_switch = 0.0
     try:
         while True:
             now = time.time()
@@ -670,39 +623,6 @@ def main():
                 update_lcd(lcd, "Put paper", "Press button")
             elif not button.is_pressed:
                 update_lcd(lcd, current_student[:16], "Press button")
-
-            # Steam sensor: наступний учень (скасовує Ready)
-            if student_sensor is not None:
-                level = read_steam_sensor_level(student_sensor)
-                if level is not None:
-                    falling_edge = (
-                        sensor_last_stable == SENSOR_IDLE_HIGH and level == 0
-                    )
-                    if (
-                        falling_edge
-                        and (now - last_sensor_switch) >= SENSOR_COOLDOWN_S
-                    ):
-                        print(
-                            "[ACTION] Steam sensor edge HIGH→LOW - next student",
-                            flush=True,
-                        )
-                        beeper.click()
-                        ready_for_analysis = False
-                        leds.set_standby()
-                        current_student = next_student_on_server()
-                        last_sync = time.time()
-                        last_sensor_switch = time.time()
-                        apply_student_on_lcd(lcd, current_student)
-                        release_deadline = time.time() + 2.5
-                        while time.time() < release_deadline:
-                            released = read_steam_sensor_level(student_sensor)
-                            if released == SENSOR_IDLE_HIGH:
-                                break
-                            time.sleep(0.02)
-                        sensor_last_stable = SENSOR_IDLE_HIGH
-                        time.sleep(0.05)
-                        continue
-                    sensor_last_stable = level
 
             if button.is_pressed:
                 beeper.click()
@@ -740,11 +660,6 @@ def main():
         beeper.close()
         try:
             button.close()
-        except Exception:
-            pass
-        try:
-            if student_sensor is not None:
-                student_sensor.close()
         except Exception:
             pass
         cap.release()
