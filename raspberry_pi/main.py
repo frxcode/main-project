@@ -3,10 +3,14 @@
 МАН — Raspberry Pi: двоетапна перевірка робіт.
 
 Піни (BCM):
-  SK6812 data  → GPIO 18 (PWM0 / DMA 10; потрібен dtparam=audio=off)
+  SK6812 data  → GPIO 18 (PWM0), також GPIO 12 (той самий PWM0)
+                 і GPIO 13 (PWM1). Один кадр на всі три, бо дріт
+                 переносили між цими пінами.
   Кнопка       → GPIO 17 (pull_up)
-  Баззер       → GPIO 13
+  Баззер       → GPIO 22 (звичайний GPIO, не PWM)
   LCD 16x2     → I2C 0x27
+  PWM: dtparam=audio=off і force_pwm_open=0, інакше firmware
+  тримає тактовий генератор PWM.
 
 Стани LED: райдуга → фіолетовий (Pass 1 OK) → синій пульс (Pass 2) →
 зелений / жовтий / червоний за %.
@@ -17,6 +21,7 @@ from __future__ import annotations
 import colorsys
 import math
 import os
+import subprocess
 import threading
 import time
 from enum import Enum, auto
@@ -24,19 +29,24 @@ from typing import Optional
 
 import cv2
 import requests
-from gpiozero import Button, Buzzer
+from gpiozero import Button, Buzzer, Device
 from RPLCD.i2c import CharLCD
 
+# PWM0 data pins. GPIO 12 and GPIO 18 are the same PWM channel, so the
+# waveform on 18 is mirrored onto 12. GPIO 13 is PWM1 and needs its own
+# channel, otherwise the buzzer's plain output holds the data line low.
 LED_PIN = 18
+LED_MIRROR_PIN = 12
+LED_PIN_ALT = 13
 BUTTON_PIN = 17
-BUZZER_PIN = 13
+BUZZER_PIN = 22
 LCD_I2C_ADDRESS = 0x27
 
 LED_COUNT = 16
 LED_FREQ_HZ = 800_000
 LED_DMA = 10
 LED_CHANNEL = 0
-LED_BRIGHTNESS = 100
+LED_BRIGHTNESS = 180
 LED_INVERT = False
 LED_FRAME_DELAY_S = 0.04
 LED_TRANSITION_ALPHA = 0.18
@@ -133,11 +143,28 @@ class Beeper:
             pass
 
 
-class LedStrip:
-    """SK6812 on GPIO 18 — hardware PWM channel 0, DMA 10.
+def use_software_gpio() -> None:
+    """Keep the button and buzzer off the hardware PWM block.
 
-    Animations (rainbow, blue pulse) run in a daemon thread so the button
-    and camera loop stay responsive. stop() clears the strip.
+    gpiozero's hardware PWM backend shares the PWM clock with the LED
+    strip. A buzzer on that clock stretches the SK6812 timing until the
+    pixels ignore the frame. lgpio toggles plain outputs instead.
+    """
+    try:
+        from gpiozero.pins.lgpio import LGPIOFactory
+
+        Device.pin_factory = LGPIOFactory()
+    except Exception as exc:
+        print(f"[WARN] Software GPIO factory unavailable: {exc}", flush=True)
+
+
+class LedStrip:
+    """SK6812 frames on GPIO 18, mirrored to GPIO 12 and GPIO 13.
+
+    Channel 0 is PWM0 (GPIO 18, DMA 10). GPIO 12 is the other PWM0 pad, so
+    it carries the same waveform. Channel 1 is PWM1 on GPIO 13. Rainbow and
+    the blue pulse run in a daemon thread; purple and the result colors are
+    written solid immediately.
     """
 
     READY_PURPLE = (160, 0, 255)
@@ -146,7 +173,9 @@ class LedStrip:
         self.count = count
         self._pixels = None
         self._Color = None
-        self._lock = threading.Lock()
+        self._ws = None
+        self._ch1 = None
+        self._lock = threading.RLock()
         self._mode = LedMode.STANDBY
         self._result_color = (0, 180, 0)
         self._stop = threading.Event()
@@ -160,6 +189,7 @@ class LedStrip:
             from rpi_ws281x import PixelStrip, Color, ws  # type: ignore
 
             self._Color = Color
+            self._ws = ws
             strip_type = getattr(ws, "WS2811_STRIP_GRB", None)
             args = (
                 count,
@@ -175,11 +205,22 @@ class LedStrip:
                 if strip_type is not None
                 else PixelStrip(*args)
             )
+            if strip_type is not None:
+                ch1 = ws.ws2811_channel_get(strip._leds, 1)
+                ws.ws2811_channel_t_gamma_set(ch1, list(range(256)))
+                ws.ws2811_channel_t_count_set(ch1, count)
+                ws.ws2811_channel_t_gpionum_set(ch1, LED_PIN_ALT)
+                ws.ws2811_channel_t_invert_set(ch1, 1 if LED_INVERT else 0)
+                ws.ws2811_channel_t_brightness_set(ch1, LED_BRIGHTNESS)
+                ws.ws2811_channel_t_strip_type_set(ch1, strip_type)
+                self._ch1 = ch1
             strip.begin()
             self._pixels = strip
+            self._reassert_pins()
             print(
-                f"[SYSTEM] LED GPIO {pin} freq={LED_FREQ_HZ} dma={LED_DMA} "
-                f"ch={LED_CHANNEL} brightness={LED_BRIGHTNESS} invert={LED_INVERT}",
+                f"[SYSTEM] LED GPIO {pin}+{LED_MIRROR_PIN} PWM0 and "
+                f"GPIO {LED_PIN_ALT} PWM1 freq={LED_FREQ_HZ} dma={LED_DMA} "
+                f"brightness={LED_BRIGHTNESS} invert={LED_INVERT} type=GRB",
                 flush=True,
             )
         except Exception as exc:
@@ -187,6 +228,24 @@ class LedStrip:
             if hasattr(os, "geteuid") and os.geteuid() != 0:
                 print("[ERROR] Run as root for LED PWM access", flush=True)
             self._pixels = None
+            self._ch1 = None
+
+    def _reassert_pins(self):
+        """Keep the data pads on PWM after gpiozero opens the button."""
+        for pin, func in (
+            (str(LED_MIRROR_PIN), "a0"),  # GPIO 12 PWM0
+            ("18", "a5"),                  # GPIO 18 PWM0
+            (str(LED_PIN_ALT), "a0"),      # GPIO 13 PWM1
+            ("19", "ip"),                  # old sensor pad, leave idle
+        ):
+            try:
+                subprocess.run(
+                    ["pinctrl", "set", pin, func],
+                    check=False,
+                    capture_output=True,
+                )
+            except Exception as exc:
+                print(f"[WARN] pin {pin} mux failed: {exc}", flush=True)
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -210,7 +269,7 @@ class LedStrip:
         """Student matched — solid purple immediately."""
         with self._lock:
             self._mode = LedMode.READY
-        self._paint_solid(self.READY_PURPLE)
+            self._paint_solid(self.READY_PURPLE)
 
     def set_processing(self):
         """Pass 2 waiting for the server — pulsing blue."""
@@ -229,37 +288,39 @@ class LedStrip:
         with self._lock:
             self._result_color = color
             self._mode = LedMode.RESULT
-        self._paint_solid(color)
+            self._paint_solid(color)
 
     def _loop(self):
         while not self._stop.is_set():
             with self._lock:
                 mode = self._mode
                 result_color = self._result_color
-            try:
-                if mode == LedMode.STANDBY:
-                    self._draw_rainbow()
-                elif mode == LedMode.READY:
-                    self._paint_solid(self.READY_PURPLE)
-                elif mode == LedMode.PROCESSING:
-                    self._draw_pulse_blue()
+                try:
+                    if mode == LedMode.STANDBY:
+                        self._draw_rainbow()
+                    elif mode == LedMode.READY:
+                        self._paint_solid(self.READY_PURPLE)
+                    elif mode == LedMode.PROCESSING:
+                        self._draw_pulse_blue()
+                    else:
+                        self._paint_solid(result_color)
+                except Exception as exc:
+                    print(f"[WARN] LED frame failed: {exc}", flush=True)
                 else:
-                    self._paint_solid(result_color)
-            except Exception as exc:
-                print(f"[WARN] LED frame failed: {exc}", flush=True)
-                time.sleep(0.2)
-                continue
+                    self._phase += LED_FRAME_DELAY_S
             time.sleep(LED_FRAME_DELAY_S)
-            self._phase += LED_FRAME_DELAY_S
 
     def _show(self):
         if self._pixels is not None:
             self._pixels.show()
 
     def _set_pixel(self, i: int, r: int, g: int, b: int):
-        if self._pixels is None:
+        if self._pixels is None or self._Color is None:
             return
-        self._pixels.setPixelColor(i, self._Color(int(r), int(g), int(b)))
+        color = self._Color(int(r), int(g), int(b))
+        self._pixels.setPixelColor(i, color)
+        if self._ch1 is not None and self._ws is not None:
+            self._ws.ws2811_led_set(self._ch1, i, color)
 
     def _clear(self):
         if self._pixels is None:
@@ -464,6 +525,7 @@ def pass2_analyze(
 
 def main():
     print("[SYSTEM] Starting", flush=True)
+    use_software_gpio()
 
     try:
         lcd = CharLCD("PCF8574", LCD_I2C_ADDRESS, port=1, cols=16, rows=2)
@@ -490,6 +552,7 @@ def main():
 
     try:
         button = Button(BUTTON_PIN, pull_up=True, bounce_time=BUTTON_BOUNCE_S)
+        leds._reassert_pins()
     except Exception as exc:
         print(f"[ERROR] Button: {exc}", flush=True)
         update_lcd(lcd, "System fail", "Code 102")
