@@ -36,13 +36,12 @@ LED_COUNT = 16
 LED_FREQ_HZ = 800_000
 LED_DMA = 10
 LED_CHANNEL = 0
-LED_BRIGHTNESS = 180
+LED_BRIGHTNESS = 100
 LED_INVERT = False
 LED_FRAME_DELAY_S = 0.04
 LED_TRANSITION_ALPHA = 0.18
 RAINBOW_SPEED = 0.05
 PULSE_SPEED = 2.0
-RESULT_PULSE_SPEED = 1.1
 
 BUTTON_BOUNCE_S = 0.08
 SYNC_INTERVAL_S = 2.0
@@ -135,9 +134,13 @@ class Beeper:
 
 
 class LedStrip:
-    """SK6812 on GPIO 18 — hardware PWM (channel 0, DMA 10)."""
+    """SK6812 on GPIO 18 — hardware PWM channel 0, DMA 10.
 
-    READY_PURPLE = (148, 0, 211)
+    Animations (rainbow, blue pulse) run in a daemon thread so the button
+    and camera loop stay responsive. stop() clears the strip.
+    """
+
+    READY_PURPLE = (160, 0, 255)
 
     def __init__(self, pin: int = LED_PIN, count: int = LED_COUNT):
         self.count = count
@@ -175,7 +178,8 @@ class LedStrip:
             strip.begin()
             self._pixels = strip
             print(
-                f"[SYSTEM] LED GPIO {pin} PWM ch={LED_CHANNEL} dma={LED_DMA}",
+                f"[SYSTEM] LED GPIO {pin} freq={LED_FREQ_HZ} dma={LED_DMA} "
+                f"ch={LED_CHANNEL} brightness={LED_BRIGHTNESS} invert={LED_INVERT}",
                 flush=True,
             )
         except Exception as exc:
@@ -198,28 +202,34 @@ class LedStrip:
         self._clear()
 
     def set_standby(self):
+        """Waiting for scan — rainbow (background thread)."""
         with self._lock:
             self._mode = LedMode.STANDBY
 
     def set_ready(self):
+        """Student matched — solid purple immediately."""
         with self._lock:
             self._mode = LedMode.READY
+        self._paint_solid(self.READY_PURPLE)
 
     def set_processing(self):
+        """Pass 2 waiting for the server — pulsing blue."""
         with self._lock:
             self._mode = LedMode.PROCESSING
 
     def set_result(self, ai_percent: int):
+        """Solid result color: green / orange / red."""
         pct = max(0, min(100, int(ai_percent)))
         if pct < 25:
-            color = (0, 220, 40)
+            color = (0, 255, 0)
         elif pct < 75:
             color = (255, 140, 0)
         else:
-            color = (255, 20, 20)
+            color = (255, 0, 0)
         with self._lock:
             self._result_color = color
             self._mode = LedMode.RESULT
+        self._paint_solid(color)
 
     def _loop(self):
         while not self._stop.is_set():
@@ -230,11 +240,11 @@ class LedStrip:
                 if mode == LedMode.STANDBY:
                     self._draw_rainbow()
                 elif mode == LedMode.READY:
-                    self._draw_solid(self.READY_PURPLE)
+                    self._paint_solid(self.READY_PURPLE)
                 elif mode == LedMode.PROCESSING:
                     self._draw_pulse_blue()
                 else:
-                    self._draw_solid(result_color)
+                    self._paint_solid(result_color)
             except Exception as exc:
                 print(f"[WARN] LED frame failed: {exc}", flush=True)
                 time.sleep(0.2)
@@ -282,14 +292,20 @@ class LedStrip:
             colors.append((r * 255, g * 255, b * 255))
         self._draw_colors(colors)
 
-    def _draw_pulse_blue(self):
-        level = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(self._phase * PULSE_SPEED))
-        self._draw_colors([(0, int(40 * level), int(255 * level)) for _ in range(self.count)])
-
-    def _draw_solid(self, color):
+    def _paint_solid(self, color):
+        """Write a solid color immediately (no blend, no breathe)."""
+        if self._pixels is None:
+            return
         r, g, b = color
-        level = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(self._phase * RESULT_PULSE_SPEED))
-        self._draw_colors([(r * level, g * level, b * level) for _ in range(self.count)])
+        colors = [(r, g, b) for _ in range(self.count)]
+        for i, (rr, gg, bb) in enumerate(colors):
+            self._set_pixel(i, rr, gg, bb)
+        self._current_colors = colors
+        self._show()
+
+    def _draw_pulse_blue(self):
+        level = 0.2 + 0.8 * (0.5 + 0.5 * math.sin(self._phase * PULSE_SPEED))
+        self._draw_colors([(0, int(30 * level), int(255 * level)) for _ in range(self.count)])
 
 
 def ping_server() -> bool:
