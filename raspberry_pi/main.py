@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-МАН — Raspberry Pi: двоетапна перевірка робіт на ШІ.
-
-Стартовий стан / після перевірки: райдужні LED + LCD «Choose student / web or scan doc».
-Етап 1 (кнопка): фото → ШІ ім'я (латиниця на LCD) → БД → фіолетовий Ready.
-Етап 2 (кнопка): повна перевірка → зелений / жовтий / червоний → знову idle.
+МАН — Raspberry Pi: двоетапна перевірка робіт.
 
 Піни (BCM):
-  SK6812 / WS2812 data  → GPIO 18  (physical pin 12, живлення стрічки — зовнішні 5V, GND спільний)
-  Фізична кнопка        → GPIO 17  (S→GPIO17, V→3.3V, G→GND; pull_up у коді)
-  Активний баззер       → GPIO 13
-  LCD 16x2 I2C          → адреса 0x27 (SDA GPIO 2, SCL GPIO 3)
+  SK6812 data  → GPIO 18 (PWM0 / DMA 10; потрібен dtparam=audio=off)
+  Кнопка       → GPIO 17 (pull_up)
+  Баззер       → GPIO 13
+  LCD 16x2     → I2C 0x27
 
-Сенсор (GPIO 19 / steam/touch): вимкнено — входи ігноруються.
+Стани LED: райдуга → фіолетовий (Pass 1 OK) → синій пульс (Pass 2) →
+зелений / жовтий / червоний за %.
 """
 
 from __future__ import annotations
@@ -30,9 +27,6 @@ import requests
 from gpiozero import Button, Buzzer
 from RPLCD.i2c import CharLCD
 
-# ---------------------------------------------------------------------------
-# Піни / периферія
-# ---------------------------------------------------------------------------
 LED_PIN = 18
 BUTTON_PIN = 17
 BUZZER_PIN = 13
@@ -41,19 +35,18 @@ LCD_I2C_ADDRESS = 0x27
 LED_COUNT = 16
 LED_FREQ_HZ = 800_000
 LED_DMA = 10
-LED_CHANNEL = 0  # PWM0 → GPIO 12/18; audio must be off (dtparam=audio=off)
+LED_CHANNEL = 0
 LED_BRIGHTNESS = 180
 LED_INVERT = False
 LED_FRAME_DELAY_S = 0.04
 LED_TRANSITION_ALPHA = 0.18
-RAINBOW_SPEED = 0.05  # плавний райдужний standby до успішного Pass 1
+RAINBOW_SPEED = 0.05
 PULSE_SPEED = 2.0
 RESULT_PULSE_SPEED = 1.1
 
+BUTTON_BOUNCE_S = 0.08
 SYNC_INTERVAL_S = 2.0
 RESULT_HOLD_S = 4.0
-DOUBLE_CLICK_WINDOW_S = 0.35
-
 SERVER_URL = "http://192.168.1.90:4576"
 
 last_line1, last_line2 = "", ""
@@ -62,25 +55,20 @@ server_connected = False
 
 class LedMode(Enum):
     STANDBY = auto()
-    READY = auto()       # учень знайдений, чекаємо 2-е натискання (фіолетовий)
-    PROCESSING = auto()  # другий прохід ШІ (синє пульсування)
+    READY = auto()
+    PROCESSING = auto()
     RESULT = auto()
 
 
-def update_lcd(lcd, line1, line2):
+def update_lcd(lcd, line1, line2=""):
     global last_line1, last_line2
-    l1 = str(line1)[:16]
-    l2 = str(line2)[:16]
-
+    l1, l2 = str(line1)[:16], str(line2)[:16]
     if l1 == last_line1 and l2 == last_line2:
         return
-
     last_line1, last_line2 = l1, l2
     print(f"[LCD] {l1} | {l2}", flush=True)
-
     if lcd is None:
         return
-
     try:
         lcd.clear()
         lcd.cursor_pos = (0, 0)
@@ -91,13 +79,16 @@ def update_lcd(lcd, line1, line2):
         print(f"[WARN] LCD update failed: {exc}", flush=True)
 
 
+def show_idle_lcd(lcd):
+    update_lcd(lcd, "Choose student", "web or scan doc")
+
+
 class Beeper:
     def __init__(self, pin: int = BUZZER_PIN):
         self._buzzer = None
         try:
             self._buzzer = Buzzer(pin)
             self._buzzer.off()
-            print(f"[SYSTEM] Buzzer on GPIO {pin}", flush=True)
         except Exception as exc:
             print(f"[WARN] Buzzer unavailable: {exc}", flush=True)
 
@@ -113,8 +104,8 @@ class Beeper:
                     self._buzzer.off()
                     if i + 1 < count:
                         time.sleep(gap)
-            except Exception as exc:
-                print(f"[WARN] Buzzer beep failed: {exc}", flush=True)
+            except Exception:
+                pass
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -134,23 +125,23 @@ class Beeper:
         self.beep(0.25, 1)
 
     def close(self):
-        if self._buzzer is not None:
-            try:
-                self._buzzer.off()
-                self._buzzer.close()
-            except Exception:
-                pass
+        if self._buzzer is None:
+            return
+        try:
+            self._buzzer.off()
+            self._buzzer.close()
+        except Exception:
+            pass
 
 
 class LedStrip:
-    """Standby / ready / processing / result на GPIO 18 через hardware PWM."""
+    """SK6812 on GPIO 18 — hardware PWM (channel 0, DMA 10)."""
 
     READY_PURPLE = (148, 0, 211)
 
     def __init__(self, pin: int = LED_PIN, count: int = LED_COUNT):
         self.count = count
         self._pixels = None
-        self._backend = None
         self._Color = None
         self._lock = threading.Lock()
         self._mode = LedMode.STANDBY
@@ -166,49 +157,32 @@ class LedStrip:
             from rpi_ws281x import PixelStrip, Color, ws  # type: ignore
 
             self._Color = Color
-            # SK6812/WS2812 на стенді — порядок GRB (перевірено live-тестом)
             strip_type = getattr(ws, "WS2811_STRIP_GRB", None)
-            if strip_type is not None:
-                strip = PixelStrip(
-                    count,
-                    pin,
-                    LED_FREQ_HZ,
-                    LED_DMA,
-                    LED_INVERT,
-                    LED_BRIGHTNESS,
-                    LED_CHANNEL,
-                    strip_type,
-                )
-            else:
-                strip = PixelStrip(
-                    count,
-                    pin,
-                    LED_FREQ_HZ,
-                    LED_DMA,
-                    LED_INVERT,
-                    LED_BRIGHTNESS,
-                    LED_CHANNEL,
-                )
+            args = (
+                count,
+                pin,
+                LED_FREQ_HZ,
+                LED_DMA,
+                LED_INVERT,
+                LED_BRIGHTNESS,
+                LED_CHANNEL,
+            )
+            strip = (
+                PixelStrip(*args, strip_type)
+                if strip_type is not None
+                else PixelStrip(*args)
+            )
             strip.begin()
             self._pixels = strip
-            self._backend = "rpi_ws281x"
             print(
-                f"[SYSTEM] LED strip on GPIO {pin} via hardware PWM "
-                f"(channel={LED_CHANNEL}, dma={LED_DMA}, brightness={LED_BRIGHTNESS}, "
-                f"type=GRB)",
+                f"[SYSTEM] LED GPIO {pin} PWM ch={LED_CHANNEL} dma={LED_DMA}",
                 flush=True,
             )
         except Exception as exc:
             print(f"[ERROR] LED init failed: {exc}", flush=True)
             if hasattr(os, "geteuid") and os.geteuid() != 0:
-                print("ERROR: Run script with sudo for LED access!", flush=True)
-            print(
-                "[HINT] GPIO 18 needs dtparam=audio=off in /boot/firmware/config.txt "
-                "(audio PWM conflicts with LED PWM).",
-                flush=True,
-            )
+                print("[ERROR] Run as root for LED PWM access", flush=True)
             self._pixels = None
-            self._backend = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -228,7 +202,6 @@ class LedStrip:
             self._mode = LedMode.STANDBY
 
     def set_ready(self):
-        """Фіолетовий — Ready to start (учень підтверджений)."""
         with self._lock:
             self._mode = LedMode.READY
 
@@ -262,23 +235,21 @@ class LedStrip:
                     self._draw_pulse_blue()
                 else:
                     self._draw_solid(result_color)
-                time.sleep(LED_FRAME_DELAY_S)
             except Exception as exc:
                 print(f"[WARN] LED frame failed: {exc}", flush=True)
                 time.sleep(0.2)
+                continue
+            time.sleep(LED_FRAME_DELAY_S)
             self._phase += LED_FRAME_DELAY_S
 
     def _show(self):
-        if self._pixels is None:
-            return
-        self._pixels.show()
+        if self._pixels is not None:
+            self._pixels.show()
 
     def _set_pixel(self, i: int, r: int, g: int, b: int):
         if self._pixels is None:
             return
-        r, g, b = int(r), int(g), int(b)
-        if self._backend == "rpi_ws281x":
-            self._pixels.setPixelColor(i, self._Color(r, g, b))
+        self._pixels.setPixelColor(i, self._Color(int(r), int(g), int(b)))
 
     def _clear(self):
         if self._pixels is None:
@@ -291,23 +262,19 @@ class LedStrip:
     def _draw_colors(self, target_colors):
         if self._pixels is None:
             return
-
         blended = []
         for i, target in enumerate(target_colors):
             old = self._current_colors[i]
             color = tuple(
-                int(old[channel] + (target[channel] - old[channel]) * LED_TRANSITION_ALPHA)
-                for channel in range(3)
+                int(old[c] + (target[c] - old[c]) * LED_TRANSITION_ALPHA)
+                for c in range(3)
             )
             blended.append(color)
             self._set_pixel(i, *color)
-
         self._current_colors = blended
         self._show()
 
     def _draw_rainbow(self):
-        if self._pixels is None:
-            return
         colors = []
         for i in range(self.count):
             hue = (self._phase * RAINBOW_SPEED + i / max(1, self.count)) % 1.0
@@ -316,316 +283,199 @@ class LedStrip:
         self._draw_colors(colors)
 
     def _draw_pulse_blue(self):
-        if self._pixels is None:
-            return
         level = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(self._phase * PULSE_SPEED))
-        b = int(255 * level)
-        g = int(40 * level)
-        self._draw_colors([(0, g, b) for _ in range(self.count)])
+        self._draw_colors([(0, int(40 * level), int(255 * level)) for _ in range(self.count)])
 
     def _draw_solid(self, color):
-        if self._pixels is None:
-            return
         r, g, b = color
         level = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(self._phase * RESULT_PULSE_SPEED))
         self._draw_colors([(r * level, g * level, b * level) for _ in range(self.count)])
 
 
 def ping_server() -> bool:
-    """Heartbeat до бекенда без підхоплення активного учня з попередньої сесії."""
     global server_connected
     try:
         response = requests.get(f"{SERVER_URL}/api/pi/sync", timeout=2)
-        if response.status_code == 200:
-            server_connected = True
-            return True
+        server_connected = response.status_code == 200
+        return server_connected
+    except requests.RequestException:
         server_connected = False
-        print(f"[WARN] Server responded with {response.status_code}", flush=True)
-        return False
-    except requests.RequestException as exc:
-        server_connected = False
-        print(f"[ERROR] Server disconnected: {exc}", flush=True)
         return False
 
 
-def clear_session_on_server() -> bool:
+def clear_session_on_server() -> None:
     global server_connected
     try:
         response = requests.post(f"{SERVER_URL}/api/pi/clear_session", timeout=3)
         if response.status_code == 200:
             server_connected = True
-            print("[SESSION] cleared on server", flush=True)
-            return True
-        print(f"[WARN] clear_session status={response.status_code}", flush=True)
-        return False
-    except requests.RequestException as exc:
-        print(f"[ERROR] clear_session failed: {exc}", flush=True)
-        return False
+    except requests.RequestException:
+        pass
 
 
-def show_idle_lcd(lcd):
-    # 16x2: повне «Choose student in web or scan document»
-    update_lcd(lcd, "Choose student", "web or scan doc")
-
-
-def has_student(student_name: str) -> bool:
-    name = (student_name or "").strip()
-    return bool(name) and name.lower() != "none"
-
-
-def reset_local_session(lcd, leds: LedStrip) -> tuple[Optional[int], str, bool]:
-    """Повне скидання сесії → райдужний standby + idle LCD."""
+def reset_session(lcd, leds: LedStrip) -> tuple[Optional[int], str]:
+    """Idle: rainbow + default LCD, no cached student."""
     leds.set_standby()
     show_idle_lcd(lcd)
-    return None, "", False
+    return None, ""
 
 
-def capture_photo(cap):
+def capture_photo(cap) -> Optional[bytes]:
     for _ in range(5):
         cap.grab()
-
     ret, frame = cap.read()
     if not ret or frame is None:
-        print("[ERROR] Failed to capture image from camera", flush=True)
         return None
-
-    success, buffer = cv2.imencode(".png", frame)
-    if not success:
-        print("[ERROR] Failed to encode camera frame", flush=True)
-        return None
-
-    return buffer.tobytes()
+    ok, buffer = cv2.imencode(".png", frame)
+    return buffer.tobytes() if ok else None
 
 
-def handle_stage1_recognize(
-    lcd, cap, leds: LedStrip, beeper: Beeper
-) -> tuple[Optional[int], str]:
-    """Етап 1: фото → ШІ ім'я → пошук у БД. Повертає (student_id, display_name) або (None, '')."""
-    print("[ACTION] Stage 1: recognize student", flush=True)
-
+def pass1_recognize(lcd, cap, leds: LedStrip, beeper: Beeper) -> tuple[Optional[int], str]:
+    """Photo → AI name → DB match. Returns (student_id, display_name)."""
+    print("[ACTION] Pass 1: recognize", flush=True)
     if not server_connected:
-        print("[WARN] Server disconnected; cannot recognize", flush=True)
         update_lcd(lcd, "System fail", "Code 301")
         beeper.error()
         return None, ""
 
     update_lcd(lcd, "Reading name", "AI")
-    leds.set_processing()
-    time.sleep(0.3)
-
-    photo_bytes = capture_photo(cap)
-    if photo_bytes is None:
-        update_lcd(lcd, "Analysis fail", "Code 201")
+    photo = capture_photo(cap)
+    if photo is None:
+        update_lcd(lcd, "Camera fail", "Code 201")
         beeper.error()
-        leds.set_standby()
-        show_idle_lcd(lcd)
         return None, ""
 
     try:
         response = requests.post(
             f"{SERVER_URL}/api/pi/recognize_student",
-            files={"file": ("work.png", photo_bytes, "image/png")},
+            files={"file": ("work.png", photo, "image/png")},
             timeout=35,
         )
-        print(f"[HTTP] recognize status={response.status_code}", flush=True)
-
-        if response.status_code != 200:
-            print(f"[ERROR] Recognize failed: {response.text}", flush=True)
-            update_lcd(lcd, "Name fail", f"Code {response.status_code}")
-            beeper.error()
-            time.sleep(1.5)
-            leds.set_standby()
-            show_idle_lcd(lcd)
-            return None, ""
-
-        payload = response.json()
-        status = payload.get("status")
-        if status != "success":
-            msg = payload.get("message", "not found")
-            print(f"[WARN] Student not matched: {msg}", flush=True)
-            recognized = payload.get("recognized") or {}
-            hint = (
-                recognized.get("display_name")
-                or recognized.get("full_name")
-                or f"{recognized.get('last_name_en', '')} {recognized.get('first_name_en', '')}".strip()
-            )
-            if hint:
-                update_lcd(lcd, "Not in DB", hint[:16])
-            else:
-                update_lcd(lcd, "Name not found", "try again")
-            beeper.error()
-            time.sleep(2.0)
-            leds.set_standby()
-            show_idle_lcd(lcd)
-            return None, ""
-
-        student_id = payload.get("student_id")
-        display_name = str(payload.get("display_name") or payload.get("student_name") or "").strip()
-        try:
-            student_id = int(student_id) if student_id is not None else None
-        except (TypeError, ValueError):
-            student_id = None
-
-        if student_id is None or not has_student(display_name):
-            update_lcd(lcd, "Name fail", "Code 501")
-            beeper.error()
-            time.sleep(1.5)
-            leds.set_standby()
-            show_idle_lcd(lcd)
-            return None, ""
-
-        leds.set_ready()
-        update_lcd(lcd, display_name[:16], "Press button")
-        print(f"[READY] student_id={student_id} display={display_name}", flush=True)
-        beeper.click()
-        return student_id, display_name
-    except requests.RequestException as exc:
-        print(f"[ERROR] Network failure during recognize: {exc}", flush=True)
-        update_lcd(lcd, "Analysis fail", "Code 500")
+    except requests.RequestException:
+        update_lcd(lcd, "Network fail", "Code 500")
         beeper.error()
-        time.sleep(1.5)
-        leds.set_standby()
-        show_idle_lcd(lcd)
         return None, ""
 
-
-def handle_stage2_analyze(
-    lcd,
-    student_id: Optional[int],
-    display_name: str,
-    cap,
-    leds: LedStrip,
-    beeper: Beeper,
-) -> bool:
-    """Етап 2: повна перевірка. True = сесію треба скинути (успіх або фатальна помилка)."""
-    print("[ACTION] Stage 2: full AI check", flush=True)
-
-    if student_id is None:
-        print("[WARN] No student for stage 2", flush=True)
+    if response.status_code != 200:
+        update_lcd(lcd, "Name fail", f"Code {response.status_code}")
         beeper.error()
-        return True
+        return None, ""
 
+    payload = response.json()
+    if payload.get("status") != "success":
+        recognized = payload.get("recognized") or {}
+        hint = (
+            recognized.get("display_name")
+            or recognized.get("full_name")
+            or ""
+        ).strip()
+        update_lcd(lcd, "Not in DB", hint[:16] if hint else "try again")
+        beeper.error()
+        time.sleep(1.8)
+        return None, ""
+
+    try:
+        student_id = int(payload["student_id"])
+    except (KeyError, TypeError, ValueError):
+        update_lcd(lcd, "Name fail", "Code 501")
+        beeper.error()
+        return None, ""
+
+    display = str(payload.get("display_name") or payload.get("student_name") or "").strip()
+    if not display:
+        update_lcd(lcd, "Name fail", "Code 501")
+        beeper.error()
+        return None, ""
+
+    leds.set_ready()
+    update_lcd(lcd, display[:16], "Press button")
+    beeper.click()
+    print(f"[READY] id={student_id} name={display}", flush=True)
+    return student_id, display
+
+
+def pass2_analyze(
+    lcd, student_id: int, display_name: str, cap, leds: LedStrip, beeper: Beeper
+) -> bool:
+    """Full AI check linked to student_id. True = reset session afterwards."""
+    print("[ACTION] Pass 2: analyze", flush=True)
     if not server_connected:
-        print("[WARN] Server disconnected; cannot analyze", flush=True)
         update_lcd(lcd, "System fail", "Code 301")
         beeper.error()
         return True
 
     leds.set_processing()
     update_lcd(lcd, "Checking", "AI")
-    time.sleep(0.3)
-
-    photo_bytes = capture_photo(cap)
-    if photo_bytes is None:
-        update_lcd(lcd, "Analysis fail", "Code 201")
+    photo = capture_photo(cap)
+    if photo is None:
+        update_lcd(lcd, "Camera fail", "Code 201")
         beeper.error()
         leds.set_ready()
-        update_lcd(lcd, (display_name or "")[:16], "Press button")
+        update_lcd(lcd, display_name[:16], "Press button")
         return False
 
     try:
         response = requests.post(
             f"{SERVER_URL}/upload/",
             data={"student_id": str(student_id)},
-            files={"file": ("work.png", photo_bytes, "image/png")},
+            files={"file": ("work.png", photo, "image/png")},
             timeout=60,
         )
-        print(f"[HTTP] upload status={response.status_code}", flush=True)
-
-        if response.status_code != 200:
-            print(f"[ERROR] Upload failed: {response.text}", flush=True)
-            update_lcd(lcd, "Analysis fail", f"Code {response.status_code}")
-            beeper.error()
-            time.sleep(1.5)
-            return True
-
-        payload = response.json()
-        if payload.get("status") != "success":
-            update_lcd(lcd, "Analysis fail", "Code 501")
-            beeper.error()
-            time.sleep(1.5)
-            return True
-
-        pct = int(payload.get("ai_percent", 0))
-        pct = max(0, min(100, pct))
-        leds.set_result(pct)
-
-        if pct < 25:
-            beeper.result_ok()
-        elif pct < 75:
-            beeper.result_warn()
-        else:
-            beeper.result_bad()
-
-        update_lcd(lcd, "Analysis done", f"{pct}% AI")
-        print(f"[RESULT] ai_percent={pct}%", flush=True)
-        time.sleep(RESULT_HOLD_S)
+    except requests.RequestException:
+        update_lcd(lcd, "Network fail", "Code 500")
+        beeper.error()
         return True
-    except requests.RequestException as exc:
-        print(f"[ERROR] Network failure during upload: {exc}", flush=True)
-        update_lcd(lcd, "Analysis fail", "Code 500")
+
+    if response.status_code != 200 or response.json().get("status") != "success":
+        update_lcd(lcd, "Analysis fail", "Code 501")
         beeper.error()
         time.sleep(1.5)
         return True
 
-
-def wait_button_gesture(button: Button, already_pressed: bool = False):
-    if not already_pressed:
-        button.wait_for_press()
-
-    if button.is_pressed:
-        button.wait_for_release(timeout=3.0)
-
-    deadline = time.monotonic() + DOUBLE_CLICK_WINDOW_S
-    while time.monotonic() < deadline:
-        if button.is_pressed:
-            button.wait_for_release(timeout=3.0)
-            return "double"
-        time.sleep(0.01)
-
-    return "single"
+    pct = max(0, min(100, int(response.json().get("ai_percent", 0))))
+    leds.set_result(pct)
+    if pct < 25:
+        beeper.result_ok()
+    elif pct < 75:
+        beeper.result_warn()
+    else:
+        beeper.result_bad()
+    update_lcd(lcd, "Analysis done", f"{pct}% AI")
+    print(f"[RESULT] {pct}% AI", flush=True)
+    time.sleep(RESULT_HOLD_S)
+    return True
 
 
 def main():
-    print("[SYSTEM] Raspberry Pi started", flush=True)
-    update_lcd(None, "Welcome", "")
+    print("[SYSTEM] Starting", flush=True)
 
     try:
         lcd = CharLCD("PCF8574", LCD_I2C_ADDRESS, port=1, cols=16, rows=2)
-        print("[SYSTEM] LCD detected", flush=True)
     except Exception as exc:
-        print(f"[WARN] LCD not found: {exc}", flush=True)
-        lcd = None
-        update_lcd(lcd, "System fail", "Code 101")
+        print(f"[ERROR] LCD: {exc}", flush=True)
         return
 
-    beeper = Beeper(BUZZER_PIN)
-    leds = LedStrip(LED_PIN, LED_COUNT)
+    beeper = Beeper()
+    leds = LedStrip()
     leds.start()
     leds.set_standby()
-
-    update_lcd(lcd, "Welcome", "")
-    time.sleep(0.8)
     update_lcd(lcd, "Starting", "system")
     time.sleep(1.0)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("[ERROR] Camera could not open", flush=True)
         update_lcd(lcd, "System fail", "Code 202")
         beeper.error()
         leds.stop()
         beeper.close()
         return
-
     cap.set(3, 640)
     cap.set(4, 480)
 
     try:
-        button = Button(BUTTON_PIN, pull_up=True)
-        print(f"[SYSTEM] Button on GPIO {BUTTON_PIN} (pull_up)", flush=True)
+        button = Button(BUTTON_PIN, pull_up=True, bounce_time=BUTTON_BOUNCE_S)
     except Exception as exc:
-        print(f"[ERROR] Button failed: {exc}", flush=True)
+        print(f"[ERROR] Button: {exc}", flush=True)
         update_lcd(lcd, "System fail", "Code 102")
         beeper.error()
         leds.stop()
@@ -633,80 +483,55 @@ def main():
         cap.release()
         return
 
-    # Чиста сесія: без кешованого учня, сенсор вимкнено
     clear_session_on_server()
     ping_server()
-    session_student_id: Optional[int] = None
-    session_display_name = ""
-    ready_for_analysis = False
-    session_student_id, session_display_name, ready_for_analysis = reset_local_session(
-        lcd, leds
-    )
+    student_id, display_name = reset_session(lcd, leds)
+    ready = False
     last_sync = 0.0
-    print("[SYSTEM] Idle — rainbow + Choose student / web or scan doc", flush=True)
+    print("[SYSTEM] Idle", flush=True)
 
     try:
         while True:
             now = time.time()
-
             if now - last_sync >= SYNC_INTERVAL_S:
                 ping_server()
-                last_sync = time.time()
+                last_sync = now
 
             if not server_connected:
-                if ready_for_analysis:
-                    session_student_id, session_display_name, ready_for_analysis = (
-                        reset_local_session(lcd, leds)
-                    )
+                if ready:
+                    student_id, display_name = reset_session(lcd, leds)
+                    ready = False
                 update_lcd(lcd, "System fail", "Code 301")
-            elif ready_for_analysis and session_student_id is not None:
+            elif ready and student_id is not None:
                 if not button.is_pressed:
-                    update_lcd(lcd, session_display_name[:16], "Press button")
+                    update_lcd(lcd, display_name[:16], "Press button")
             elif not button.is_pressed:
                 show_idle_lcd(lcd)
 
-            if button.is_pressed:
-                beeper.click()
-                gesture = wait_button_gesture(button, already_pressed=True)
-                if gesture == "double":
-                    print("[ACTION] Double click — reset session", flush=True)
+            if not button.is_pressed:
+                time.sleep(0.05)
+                continue
+
+            beeper.click()
+            button.wait_for_release(timeout=3.0)
+            time.sleep(0.05)  # settle after bounce
+
+            if ready and student_id is not None:
+                if pass2_analyze(lcd, student_id, display_name, cap, leds, beeper):
                     clear_session_on_server()
-                    session_student_id, session_display_name, ready_for_analysis = (
-                        reset_local_session(lcd, leds)
-                    )
-                    time.sleep(0.3)
-                    continue
-
-                if ready_for_analysis:
-                    done = handle_stage2_analyze(
-                        lcd,
-                        session_student_id,
-                        session_display_name,
-                        cap,
-                        leds,
-                        beeper,
-                    )
-                    if done:
-                        clear_session_on_server()
-                        session_student_id, session_display_name, ready_for_analysis = (
-                            reset_local_session(lcd, leds)
-                        )
+                    student_id, display_name = reset_session(lcd, leds)
+                    ready = False
+            else:
+                sid, name = pass1_recognize(lcd, cap, leds, beeper)
+                if sid is not None:
+                    student_id, display_name, ready = sid, name, True
                 else:
-                    sid, dname = handle_stage1_recognize(lcd, cap, leds, beeper)
-                    if sid is not None:
-                        session_student_id = sid
-                        session_display_name = dname
-                        ready_for_analysis = True
-                    else:
-                        clear_session_on_server()
-                        session_student_id, session_display_name, ready_for_analysis = (
-                            reset_local_session(lcd, leds)
-                        )
-                time.sleep(0.5)
-
-            time.sleep(0.1)
+                    clear_session_on_server()
+                    student_id, display_name = reset_session(lcd, leds)
+                    ready = False
+            time.sleep(0.3)
     except KeyboardInterrupt:
-        print("[SYSTEM] Interrupted", flush=True)
+        print("[SYSTEM] Stopped", flush=True)
     finally:
         clear_session_on_server()
         leds.stop()

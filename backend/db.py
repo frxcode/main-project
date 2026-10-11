@@ -438,7 +438,7 @@ def find_student_by_parts(
     full_name: Optional[str] = None,
     prefer_id: Optional[int] = None,
 ):
-    """Пошук учня з AI-розпізнавання: спочатку точне повне ім'я, без авто-створення."""
+    """Пошук за повним ім'ям з AI (без створення профілів)."""
     first = normalize_name_part(first_name or "")
     last = normalize_name_part(last_name or "")
     if first and last:
@@ -446,25 +446,17 @@ def find_student_by_parts(
         if exact:
             return exact
 
-    queries = []
+    # full_name на кшталт "Name Surname" / "Surname Name"
     if full_name and str(full_name).strip():
-        queries.append(normalize_name_part(str(full_name)))
-    if first and last:
-        queries.extend([f"{first} {last}", f"{last} {first}"])
-
-    # Частковий збіг лише якщо AI дав лише одну частину
-    if first and not last:
-        queries.append(first)
-    if last and not first:
-        queries.append(last)
-
-    seen = set()
-    for q in queries:
-        key = q.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        student = find_student_by_name(q, prefer_id=prefer_id)
+        parts = normalize_name_part(str(full_name)).split()
+        if len(parts) >= 2:
+            exact = find_student_by_exact_full_name(parts[0], " ".join(parts[1:]))
+            if exact:
+                return exact
+            exact = find_student_by_exact_full_name(parts[-1], " ".join(parts[:-1]))
+            if exact:
+                return exact
+        student = find_student_by_name(normalize_name_part(str(full_name)), prefer_id=prefer_id)
         if student:
             return student
     return None

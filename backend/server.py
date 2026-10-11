@@ -569,32 +569,6 @@ def pi_sync():
     }
 
 
-@app.post("/api/pi/next_student")
-def pi_next_student():
-    """Короткий дотик на Pi — наступний учень у списку."""
-    global last_pi_sync
-    last_pi_sync = time.time()
-    students = db.list_all_students()
-    if not students:
-        db.set_active_student_id(None)
-        return {"status": "ok", "active_student_id": None, "active_student_name": "None"}
-
-    active_id = db.get_active_student_id()
-    ids = [s["id"] for s in students]
-    if active_id in ids:
-        next_id = ids[(ids.index(active_id) + 1) % len(ids)]
-    else:
-        next_id = ids[0]
-
-    db.set_active_student_id(next_id)
-    student = db.get_student(next_id)
-    return {
-        "status": "ok",
-        "active_student_id": next_id,
-        "active_student_name": full_name(student) if student else "None",
-    }
-
-
 @app.get("/api/pi/status")
 def pi_status():
     return {"status": "ok", "is_online": (time.time() - last_pi_sync) < 10}
@@ -602,31 +576,29 @@ def pi_status():
 
 @app.post("/api/pi/clear_session")
 def pi_clear_session():
-    """Скинути активну сесію стенду: без авто-вибору учня."""
+    """Скинути активну сесію стенду (без авто-вибору учня)."""
     global last_pi_sync
     last_pi_sync = time.time()
     db.set_active_student_id(None)
     return {"status": "ok", "active_student_id": None, "active_student_name": "None"}
 
 
-def _ascii_display_name(recognized: dict, student) -> str:
-    """Латиниця для LCD (макс. 16 символів на клієнті)."""
+def _display_name_latin(recognized: dict, student) -> str:
     display = (recognized.get("display_name") or "").strip()
     if not display:
         first_en = (recognized.get("first_name_en") or "").strip()
         last_en = (recognized.get("last_name_en") or "").strip()
         display = f"{last_en} {first_en}".strip()
     if not display and student:
-        # fallback: лише ASCII з повного імені БД
         raw = full_name(student)
-        display = "".join(ch if ord(ch) < 128 else "" for ch in raw).strip()
-        display = " ".join(display.split()) or raw
+        ascii_only = "".join(ch if ord(ch) < 128 else "" for ch in raw).strip()
+        display = " ".join(ascii_only.split()) or raw
     return display[:32]
 
 
 @app.post("/api/pi/recognize_student")
 async def recognize_student(file: UploadFile = File(...)):
-    """Перший прохід: ШІ читає ім'я з фото і шукає учня в БД (без авто-реєстрації)."""
+    """Pass 1: AI name from photo → match existing student (never auto-create)."""
     global last_pi_sync
     last_pi_sync = time.time()
 
@@ -648,50 +620,28 @@ async def recognize_student(file: UploadFile = File(...)):
 
     if recognized.get("error"):
         return {"status": "error", "message": recognized["error"], "recognized": recognized}
-
     if not recognized.get("found"):
-        return {
-            "status": "not_found",
-            "message": "name not found on photo",
-            "recognized": recognized,
-        }
+        return {"status": "not_found", "message": "name not found on photo", "recognized": recognized}
 
-    # Шукаємо лише серед наявних учнів — нові профілі тут не створюємо
-    # без prefer_id, щоб не підставляти попередню сесію
     student = db.find_student_by_parts(
         first_name=recognized.get("first_name"),
         last_name=recognized.get("last_name"),
         full_name=recognized.get("full_name"),
-        prefer_id=None,
+    ) or db.find_student_by_parts(
+        first_name=recognized.get("first_name_en"),
+        last_name=recognized.get("last_name_en"),
+        full_name=f"{recognized.get('first_name_en', '')} {recognized.get('last_name_en', '')}".strip() or None,
     )
     if not student:
-        student = db.find_student_by_parts(
-            first_name=recognized.get("first_name_en"),
-            last_name=recognized.get("last_name_en"),
-            full_name=(
-                f"{recognized.get('first_name_en', '')} {recognized.get('last_name_en', '')}".strip()
-                or None
-            ),
-            prefer_id=None,
-        )
-
-    if not student:
-        return {
-            "status": "not_found",
-            "message": "student not in database",
-            "recognized": recognized,
-        }
+        return {"status": "not_found", "message": "student not in database", "recognized": recognized}
 
     db.set_active_student_id(student["id"])
-    display_name = _ascii_display_name(recognized, student)
     return {
         "status": "success",
         "student_id": student["id"],
         "student_name": full_name(student),
-        "display_name": display_name,
-        "folder_name": student.get("folder_name"),
+        "display_name": _display_name_latin(recognized, student),
         "recognized": recognized,
-        "linked": True,
     }
 
 
@@ -699,39 +649,21 @@ async def recognize_student(file: UploadFile = File(...)):
 async def upload_image(
     request: Request,
     file: UploadFile = File(...),
-    student_name: Optional[str] = Form(None),
     student_id: Optional[int] = Form(None),
 ):
-    """Pass 2: робота жорстко прив'язується до student_id облікового запису в БД."""
-    if not student_name:
-        student_name = request.query_params.get("student_name")
+    """Pass 2: analysis permanently linked to student_id."""
     if student_id is None and request.query_params.get("student_id"):
         try:
             student_id = int(request.query_params.get("student_id"))
         except ValueError:
             student_id = None
 
-    student = None
-    if student_id is not None:
-        student = db.get_student(int(student_id))
-        if not student:
-            return {
-                "status": "error",
-                "message": f"student_id {student_id} not found — submission not linked",
-            }
-    elif student_name:
-        # legacy: резолвимо ім'я в конкретний акаунт, далі все одно пишемо по id
-        student = db.find_student_by_name(student_name, prefer_id=None)
-        if not student:
-            return {
-                "status": "error",
-                "message": f'student "{student_name}" not found — submission not linked',
-            }
-    else:
-        return {
-            "status": "error",
-            "message": "student_id is required to link the submission to a student account",
-        }
+    if student_id is None:
+        return {"status": "error", "message": "student_id is required"}
+
+    student = db.get_student(int(student_id))
+    if not student:
+        return {"status": "error", "message": f"student_id {student_id} not found"}
 
     bound_id = int(student["id"])
     verifier_dir, examples_dir = student_dirs(student)
@@ -746,11 +678,9 @@ async def upload_image(
             "status": "success",
             "student_id": bound_id,
             "student_name": full_name(student),
-            "folder_name": student.get("folder_name"),
             "ai_percent": int(cached["ai_percent"]),
             "description": cached["description"],
             "cached": True,
-            "linked": True,
         }
 
     filename = f"{file_hash}.png"
@@ -765,7 +695,6 @@ async def upload_image(
     verdict_payload = {
         "student_id": bound_id,
         "student_name": full_name(student),
-        "folder_name": student.get("folder_name"),
         "filename": filename,
         "file_hash": file_hash,
         "ai_percent": ai_percent,
@@ -777,19 +706,15 @@ async def upload_image(
         encoding="utf-8",
     )
     db.add_work(bound_id, file_hash, filename, ai_percent, description, timestamp)
-
-    # Переконуємось, що активна сесія стенду вказує на той самий акаунт
     db.set_active_student_id(bound_id)
 
     return {
         "status": "success",
         "student_id": bound_id,
         "student_name": full_name(student),
-        "folder_name": student.get("folder_name"),
         "ai_percent": ai_percent,
         "description": description,
         "cached": False,
-        "linked": True,
     }
 
 
