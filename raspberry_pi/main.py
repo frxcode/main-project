@@ -41,8 +41,8 @@ LCD_I2C_ADDRESS = 0x27
 LED_COUNT = 16
 LED_FREQ_HZ = 800_000
 LED_DMA = 10
-LED_CHANNEL = 0
-LED_BRIGHTNESS = 100
+LED_CHANNEL = 0  # PWM0 → GPIO 12/18; audio must be off (dtparam=audio=off)
+LED_BRIGHTNESS = 180
 LED_INVERT = False
 LED_FRAME_DELAY_S = 0.04
 LED_TRANSITION_ALPHA = 0.18
@@ -163,30 +163,50 @@ class LedStrip:
 
     def _init_pixels(self, pin: int, count: int):
         try:
-            from rpi_ws281x import PixelStrip, Color  # type: ignore
+            from rpi_ws281x import PixelStrip, Color, ws  # type: ignore
 
             self._Color = Color
-            strip = PixelStrip(
-                count,
-                pin,
-                LED_FREQ_HZ,
-                LED_DMA,
-                LED_INVERT,
-                LED_BRIGHTNESS,
-                LED_CHANNEL,
-            )
+            # SK6812/WS2812 на стенді — порядок GRB (перевірено live-тестом)
+            strip_type = getattr(ws, "WS2811_STRIP_GRB", None)
+            if strip_type is not None:
+                strip = PixelStrip(
+                    count,
+                    pin,
+                    LED_FREQ_HZ,
+                    LED_DMA,
+                    LED_INVERT,
+                    LED_BRIGHTNESS,
+                    LED_CHANNEL,
+                    strip_type,
+                )
+            else:
+                strip = PixelStrip(
+                    count,
+                    pin,
+                    LED_FREQ_HZ,
+                    LED_DMA,
+                    LED_INVERT,
+                    LED_BRIGHTNESS,
+                    LED_CHANNEL,
+                )
             strip.begin()
             self._pixels = strip
             self._backend = "rpi_ws281x"
             print(
                 f"[SYSTEM] LED strip on GPIO {pin} via hardware PWM "
-                f"(channel={LED_CHANNEL}, dma={LED_DMA}, brightness={LED_BRIGHTNESS})",
+                f"(channel={LED_CHANNEL}, dma={LED_DMA}, brightness={LED_BRIGHTNESS}, "
+                f"type=GRB)",
                 flush=True,
             )
         except Exception as exc:
             print(f"[ERROR] LED init failed: {exc}", flush=True)
             if hasattr(os, "geteuid") and os.geteuid() != 0:
                 print("ERROR: Run script with sudo for LED access!", flush=True)
+            print(
+                "[HINT] GPIO 18 needs dtparam=audio=off in /boot/firmware/config.txt "
+                "(audio PWM conflicts with LED PWM).",
+                flush=True,
+            )
             self._pixels = None
             self._backend = None
 
