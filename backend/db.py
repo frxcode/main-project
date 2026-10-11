@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS students (
     created_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_students_teacher ON students(teacher_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_fullname_unique
+    ON students (lower(trim(first_name)), lower(trim(last_name)));
 CREATE TABLE IF NOT EXISTS works (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -46,11 +48,24 @@ CREATE TABLE IF NOT EXISTS works (
     timestamp   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_works_student ON works(student_id);
+CREATE INDEX IF NOT EXISTS idx_works_student_hash ON works(student_id, file_hash);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
 """
+
+
+class DuplicateStudentNameError(ValueError):
+    """Повне ім'я (first + last) уже зайняте в БД."""
+
+    def __init__(self, first_name: str, last_name: str):
+        self.first_name = first_name
+        self.last_name = last_name
+        super().__init__(
+            f'Student "{first_name} {last_name}" already exists. '
+            "Full name (first + last) must be unique."
+        )
 
 
 def connect() -> sqlite3.Connection:
@@ -64,8 +79,54 @@ def init_db():
     with connect() as conn:
         conn.executescript(SCHEMA)
         conn.commit()
+    _ensure_fullname_unique_index()
     _migrate_legacy_auth()
     _migrate_legacy_students()
+
+
+def normalize_name_part(value: str) -> str:
+    """Прибрати зайві пробіли в частині імені."""
+    return " ".join(str(value or "").strip().split())
+
+
+def full_name_key(first_name: str, last_name: str) -> str:
+    """Ключ унікальності: lower(first) + '|' + lower(last)."""
+    return f"{normalize_name_part(first_name).lower()}|{normalize_name_part(last_name).lower()}"
+
+
+def _ensure_fullname_unique_index():
+    """Гарантувати UNIQUE на (first_name, last_name) навіть для старих app.db."""
+    with connect() as conn:
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_students_fullname_unique
+               ON students (lower(trim(first_name)), lower(trim(last_name)))"""
+        )
+        conn.commit()
+
+
+def find_duplicate_full_name(first_name: str, last_name: str, exclude_id: Optional[int] = None):
+    """Повертає існуючого учня з тим самим повним ім'ям, або None."""
+    key = full_name_key(first_name, last_name)
+    if key == "|":
+        return None
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM students").fetchall()
+        for r in rows:
+            if exclude_id is not None and r["id"] == exclude_id:
+                continue
+            if full_name_key(r["first_name"], r["last_name"]) == key:
+                return _row_to_student(r, _works_for(conn, r["id"]))
+    return None
+
+
+def clear_students_and_works():
+    """Повне очищення учнів і робіт (вчителі/сесії лишаються)."""
+    with connect() as conn:
+        conn.execute("DELETE FROM works")
+        conn.execute("DELETE FROM students")
+        conn.commit()
+    set_active_student_id(None)
+    print("[DB] cleared all students and works", flush=True)
 
 
 # ------------------------------- міграція -------------------------------
@@ -325,24 +386,48 @@ def find_student_by_name(name: str, prefer_id: Optional[int] = None):
         return _row_to_student(chosen, _works_for(conn, chosen["id"]))
 
 
+def find_student_by_exact_full_name(first_name: str, last_name: str):
+    """Точний збіг повного імені (first+last або last+first), без часткових збігів."""
+    first = normalize_name_part(first_name)
+    last = normalize_name_part(last_name)
+    if not first or not last:
+        return None
+    target_keys = {
+        full_name_key(first, last),
+        full_name_key(last, first),
+    }
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM students").fetchall()
+        for r in rows:
+            if full_name_key(r["first_name"], r["last_name"]) in target_keys:
+                return _row_to_student(r, _works_for(conn, r["id"]))
+    return None
+
+
 def find_student_by_parts(
     first_name: Optional[str] = None,
     last_name: Optional[str] = None,
     full_name: Optional[str] = None,
     prefer_id: Optional[int] = None,
 ):
-    """Гнучкий пошук учня з AI-розпізнавання (без створення нових профілів)."""
+    """Пошук учня з AI-розпізнавання: спочатку точне повне ім'я, без авто-створення."""
+    first = normalize_name_part(first_name or "")
+    last = normalize_name_part(last_name or "")
+    if first and last:
+        exact = find_student_by_exact_full_name(first, last)
+        if exact:
+            return exact
+
     queries = []
-    for value in (full_name,):
-        if value and str(value).strip():
-            queries.append(str(value).strip())
-    first = (first_name or "").strip()
-    last = (last_name or "").strip()
+    if full_name and str(full_name).strip():
+        queries.append(normalize_name_part(str(full_name)))
     if first and last:
         queries.extend([f"{first} {last}", f"{last} {first}"])
-    elif first:
+
+    # Частковий збіг лише якщо AI дав лише одну частину
+    if first and not last:
         queries.append(first)
-    elif last:
+    if last and not first:
         queries.append(last)
 
     seen = set()
@@ -358,16 +443,34 @@ def find_student_by_parts(
 
 
 def create_student(teacher_id: int, first_name: str, last_name: str) -> dict:
-    with connect() as conn:
-        cur = conn.execute(
-            """INSERT INTO students (teacher_id, first_name, last_name, folder_name, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (teacher_id, first_name, last_name, f"pending_{time.time_ns()}", time.time()),
-        )
-        student_id = cur.lastrowid
-        folder_name = f"{student_id}_{first_name}_{last_name}"
-        conn.execute("UPDATE students SET folder_name = ? WHERE id = ?", (folder_name, student_id))
-        conn.commit()
+    first = normalize_name_part(first_name)
+    last = normalize_name_part(last_name)
+    if not first or not last:
+        raise ValueError("first_name and last_name are required")
+
+    existing = find_duplicate_full_name(first, last)
+    if existing:
+        raise DuplicateStudentNameError(first, last)
+
+    try:
+        with connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO students (teacher_id, first_name, last_name, folder_name, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (teacher_id, first, last, f"pending_{time.time_ns()}", time.time()),
+            )
+            student_id = cur.lastrowid
+            folder_name = f"{student_id}_{first}_{last}"
+            conn.execute(
+                "UPDATE students SET folder_name = ? WHERE id = ?",
+                (folder_name, student_id),
+            )
+            conn.commit()
+    except sqlite3.IntegrityError as exc:
+        # унікальний індекс / гонка паралельних INSERT
+        if find_duplicate_full_name(first, last):
+            raise DuplicateStudentNameError(first, last) from exc
+        raise
     return get_student(student_id)
 
 

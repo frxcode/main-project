@@ -249,16 +249,28 @@ def get_students(teacher=Depends(require_teacher)):
 
 @app.post("/api/students/add")
 def add_student(first_name: str = Form(...), last_name: str = Form(...), teacher=Depends(require_teacher)):
-    first = (first_name or "").strip()
-    last = (last_name or "").strip()
+    first = db.normalize_name_part(first_name)
+    last = db.normalize_name_part(last_name)
     if not first or not last:
         raise HTTPException(status_code=400, detail="first_name and last_name are required")
 
-    student = db.create_student(teacher["id"], first, last)
+    try:
+        student = db.create_student(teacher["id"], first, last)
+    except db.DuplicateStudentNameError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     student_dirs(student)
-    if db.get_active_student_id() is None:
-        db.set_active_student_id(student["id"])
-    return {"status": "success", "student": student}
+    return {
+        "status": "success",
+        "student": student,
+        "student_id": student["id"],
+        "student_name": full_name(student),
+    }
 
 
 @app.post("/api/students/select")
@@ -677,7 +689,9 @@ async def recognize_student(file: UploadFile = File(...)):
         "student_id": student["id"],
         "student_name": full_name(student),
         "display_name": display_name,
+        "folder_name": student.get("folder_name"),
         "recognized": recognized,
+        "linked": True,
     }
 
 
@@ -688,6 +702,7 @@ async def upload_image(
     student_name: Optional[str] = Form(None),
     student_id: Optional[int] = Form(None),
 ):
+    """Pass 2: робота жорстко прив'язується до student_id облікового запису в БД."""
     if not student_name:
         student_name = request.query_params.get("student_name")
     if student_id is None and request.query_params.get("student_id"):
@@ -696,33 +711,46 @@ async def upload_image(
         except ValueError:
             student_id = None
 
-    active_id = db.get_active_student_id()
+    student = None
     if student_id is not None:
-        student = db.get_student(student_id)
+        student = db.get_student(int(student_id))
+        if not student:
+            return {
+                "status": "error",
+                "message": f"student_id {student_id} not found — submission not linked",
+            }
     elif student_name:
-        student = db.find_student_by_name(student_name, prefer_id=active_id)
-    elif active_id is not None:
-        student = db.get_student(active_id)
+        # legacy: резолвимо ім'я в конкретний акаунт, далі все одно пишемо по id
+        student = db.find_student_by_name(student_name, prefer_id=None)
+        if not student:
+            return {
+                "status": "error",
+                "message": f'student "{student_name}" not found — submission not linked',
+            }
     else:
-        student = None
+        return {
+            "status": "error",
+            "message": "student_id is required to link the submission to a student account",
+        }
 
-    if not student:
-        return {"status": "error", "message": "active student is not selected"}
-
+    bound_id = int(student["id"])
     verifier_dir, examples_dir = student_dirs(student)
     contents = await file.read()
     if not contents:
         return {"status": "error", "message": "empty file"}
 
     file_hash = hashlib.md5(contents).hexdigest()
-    cached = db.find_work_by_hash(student["id"], file_hash)
+    cached = db.find_work_by_hash(bound_id, file_hash)
     if cached:
         return {
             "status": "success",
+            "student_id": bound_id,
             "student_name": full_name(student),
+            "folder_name": student.get("folder_name"),
             "ai_percent": int(cached["ai_percent"]),
             "description": cached["description"],
             "cached": True,
+            "linked": True,
         }
 
     filename = f"{file_hash}.png"
@@ -735,22 +763,33 @@ async def upload_image(
     timestamp = time.time()
 
     verdict_payload = {
+        "student_id": bound_id,
         "student_name": full_name(student),
+        "folder_name": student.get("folder_name"),
         "filename": filename,
         "file_hash": file_hash,
         "ai_percent": ai_percent,
         "description": description,
         "timestamp": timestamp,
     }
-    (verifier_dir / f"{file_hash}.json").write_text(json.dumps(verdict_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    db.add_work(student["id"], file_hash, filename, ai_percent, description, timestamp)
+    (verifier_dir / f"{file_hash}.json").write_text(
+        json.dumps(verdict_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    db.add_work(bound_id, file_hash, filename, ai_percent, description, timestamp)
+
+    # Переконуємось, що активна сесія стенду вказує на той самий акаунт
+    db.set_active_student_id(bound_id)
 
     return {
         "status": "success",
+        "student_id": bound_id,
         "student_name": full_name(student),
+        "folder_name": student.get("folder_name"),
         "ai_percent": ai_percent,
         "description": description,
         "cached": False,
+        "linked": True,
     }
 
 
