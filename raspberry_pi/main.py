@@ -2,9 +2,9 @@
 """
 МАН — Raspberry Pi: двоетапна перевірка робіт на ШІ.
 
-Стартовий стан / після перевірки: LCD «Scan document», без авто-вибору учня.
+Стартовий стан / після перевірки: райдужні LED + LCD «Choose student / web or scan doc».
 Етап 1 (кнопка): фото → ШІ ім'я (латиниця на LCD) → БД → фіолетовий Ready.
-Етап 2 (кнопка): повна перевірка → зелений / жовтий / червоний → скидання сесії.
+Етап 2 (кнопка): повна перевірка → зелений / жовтий / червоний → знову idle.
 
 Піни (BCM):
   SK6812 / WS2812 data  → GPIO 18  (physical pin 12, живлення стрічки — зовнішні 5V, GND спільний)
@@ -46,7 +46,7 @@ LED_BRIGHTNESS = 100
 LED_INVERT = False
 LED_FRAME_DELAY_S = 0.04
 LED_TRANSITION_ALPHA = 0.18
-RAINBOW_SPEED = 0.08
+RAINBOW_SPEED = 0.05  # плавний райдужний standby до успішного Pass 1
 PULSE_SPEED = 2.0
 RESULT_PULSE_SPEED = 1.1
 
@@ -344,7 +344,8 @@ def clear_session_on_server() -> bool:
 
 
 def show_idle_lcd(lcd):
-    update_lcd(lcd, "Scan document", "")
+    # 16x2: повне «Choose student in web or scan document»
+    update_lcd(lcd, "Choose student", "web or scan doc")
 
 
 def has_student(student_name: str) -> bool:
@@ -353,7 +354,7 @@ def has_student(student_name: str) -> bool:
 
 
 def reset_local_session(lcd, leds: LedStrip) -> tuple[Optional[int], str, bool]:
-    """Повне скидання локальної сесії стенду → idle «Scan document»."""
+    """Повне скидання сесії → райдужний standby + idle LCD."""
     leds.set_standby()
     show_idle_lcd(lcd)
     return None, "", False
@@ -622,7 +623,7 @@ def main():
         lcd, leds
     )
     last_sync = 0.0
-    print("[SYSTEM] Idle — Scan document (sensor disabled)", flush=True)
+    print("[SYSTEM] Idle — rainbow + Choose student / web or scan doc", flush=True)
 
     try:
         while True:
