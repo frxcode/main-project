@@ -369,13 +369,16 @@ def delete_photo(student_id: int = Form(...), photo_url: str = Form(...), teache
 NAME_RECOGNITION_PROMPT = (
     "Ти розпізнаєш рукописний або друкований текст на фото учнівської роботи. "
     "Знайди прізвище та ім'я учня на листку (зазвичай зверху). "
-    "Зроби нормалізацію: українською кирилицею, і окремо латиницею (трансліт/англійський варіант). "
+    "Поверни кирилицю (якщо видно) і обов'язково латинський трансліт ASCII "
+    "(English/Latin characters only у *_en і display_name — для LCD 16 символів). "
+    "display_name: коротко 'Surname Name' латиницею. "
     "Не вигадуй ім'я, якщо його немає на фото. "
     "Відповідь ТІЛЬКИ JSON без markdown: "
     '{"first_name":"Ім\'я","last_name":"Прізвище","full_name":"Ім\'я Прізвище",'
-    '"first_name_en":"Name","last_name_en":"Surname","found":true} '
+    '"first_name_en":"Name","last_name_en":"Surname","display_name":"Surname Name","found":true} '
     "Якщо імені немає: "
-    '{"first_name":"","last_name":"","full_name":"","first_name_en":"","last_name_en":"","found":false}.'
+    '{"first_name":"","last_name":"","full_name":"","first_name_en":"",'
+    '"last_name_en":"","display_name":"","found":false}.'
 )
 
 
@@ -414,13 +417,19 @@ def run_name_recognition(target_photo_path) -> dict:
             contents=contents,
         )
         payload = _parse_json_response(response.text or "")
+        first_en = str(payload.get("first_name_en", "") or "").strip()
+        last_en = str(payload.get("last_name_en", "") or "").strip()
+        display = str(payload.get("display_name", "") or "").strip()
+        if not display and (first_en or last_en):
+            display = f"{last_en} {first_en}".strip()
         return {
             "found": bool(payload.get("found", bool(payload.get("full_name") or payload.get("last_name")))),
             "first_name": str(payload.get("first_name", "") or "").strip(),
             "last_name": str(payload.get("last_name", "") or "").strip(),
             "full_name": str(payload.get("full_name", "") or "").strip(),
-            "first_name_en": str(payload.get("first_name_en", "") or "").strip(),
-            "last_name_en": str(payload.get("last_name_en", "") or "").strip(),
+            "first_name_en": first_en,
+            "last_name_en": last_en,
+            "display_name": display,
         }
     except Exception as exc:
         return {
@@ -430,6 +439,7 @@ def run_name_recognition(target_photo_path) -> dict:
             "full_name": "",
             "first_name_en": "",
             "last_name_en": "",
+            "display_name": "",
             "error": str(exc),
         }
 
@@ -578,6 +588,30 @@ def pi_status():
     return {"status": "ok", "is_online": (time.time() - last_pi_sync) < 10}
 
 
+@app.post("/api/pi/clear_session")
+def pi_clear_session():
+    """Скинути активну сесію стенду: без авто-вибору учня."""
+    global last_pi_sync
+    last_pi_sync = time.time()
+    db.set_active_student_id(None)
+    return {"status": "ok", "active_student_id": None, "active_student_name": "None"}
+
+
+def _ascii_display_name(recognized: dict, student) -> str:
+    """Латиниця для LCD (макс. 16 символів на клієнті)."""
+    display = (recognized.get("display_name") or "").strip()
+    if not display:
+        first_en = (recognized.get("first_name_en") or "").strip()
+        last_en = (recognized.get("last_name_en") or "").strip()
+        display = f"{last_en} {first_en}".strip()
+    if not display and student:
+        # fallback: лише ASCII з повного імені БД
+        raw = full_name(student)
+        display = "".join(ch if ord(ch) < 128 else "" for ch in raw).strip()
+        display = " ".join(display.split()) or raw
+    return display[:32]
+
+
 @app.post("/api/pi/recognize_student")
 async def recognize_student(file: UploadFile = File(...)):
     """Перший прохід: ШІ читає ім'я з фото і шукає учня в БД (без авто-реєстрації)."""
@@ -611,11 +645,12 @@ async def recognize_student(file: UploadFile = File(...)):
         }
 
     # Шукаємо лише серед наявних учнів — нові профілі тут не створюємо
+    # без prefer_id, щоб не підставляти попередню сесію
     student = db.find_student_by_parts(
         first_name=recognized.get("first_name"),
         last_name=recognized.get("last_name"),
         full_name=recognized.get("full_name"),
-        prefer_id=db.get_active_student_id(),
+        prefer_id=None,
     )
     if not student:
         student = db.find_student_by_parts(
@@ -625,7 +660,7 @@ async def recognize_student(file: UploadFile = File(...)):
                 f"{recognized.get('first_name_en', '')} {recognized.get('last_name_en', '')}".strip()
                 or None
             ),
-            prefer_id=db.get_active_student_id(),
+            prefer_id=None,
         )
 
     if not student:
@@ -636,10 +671,12 @@ async def recognize_student(file: UploadFile = File(...)):
         }
 
     db.set_active_student_id(student["id"])
+    display_name = _ascii_display_name(recognized, student)
     return {
         "status": "success",
         "student_id": student["id"],
         "student_name": full_name(student),
+        "display_name": display_name,
         "recognized": recognized,
     }
 
