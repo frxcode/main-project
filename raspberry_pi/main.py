@@ -5,6 +5,7 @@
 Піни (BCM):
   SK6812 / WS2812 data  → GPIO 18  (physical pin 12, живлення стрічки — зовнішні 5V, GND спільний)
   Фізична кнопка        → GPIO 17  (S→GPIO17, V→3.3V, G→GND; pull_up у коді)
+  Сенсор пари/крапель   → GPIO 19  (S→GPIO19, V→3.3V, G→GND; active-HIGH)
   Активний баззер       → GPIO 13
   LCD 16x2 I2C          → адреса 0x27 (SDA GPIO 2, SCL GPIO 3)
 """
@@ -29,6 +30,7 @@ from RPLCD.i2c import CharLCD
 # ---------------------------------------------------------------------------
 LED_PIN = 18
 BUTTON_PIN = 17
+STUDENT_SENSOR_PIN = 19  # сенсор пари/крапель: перемикання учня
 BUZZER_PIN = 13
 LCD_I2C_ADDRESS = 0x27
 
@@ -495,8 +497,26 @@ def main():
         cap.release()
         return
 
+    # Сенсор пари/крапель: V→3.3V, G→GND, S→GPIO 19 (active-HIGH)
+    student_sensor = None
+    try:
+        student_sensor = Button(
+            STUDENT_SENSOR_PIN,
+            pull_up=False,
+            active_state=True,
+            bounce_time=0.08,
+        )
+        print(
+            f"[SYSTEM] Student sensor on GPIO {STUDENT_SENSOR_PIN} (active-HIGH)",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[WARN] Student sensor unavailable: {exc}", flush=True)
+        student_sensor = None
+
     current_student = "None"
     last_sync = 0.0
+    sensor_was_pressed = False
     try:
         while True:
             now = time.time()
@@ -512,6 +532,23 @@ def main():
             elif not button.is_pressed:
                 student_text = current_student[:16]
                 update_lcd(lcd, student_text, "Press button")
+
+            # Кожен дотик сенсора → наступний учень (циклічно через бекенд)
+            if student_sensor is not None:
+                sensor_pressed = student_sensor.is_pressed
+                if sensor_pressed and not sensor_was_pressed:
+                    print("[ACTION] Sensor touch - next student", flush=True)
+                    beeper.click()
+                    current_student = next_student_on_server()
+                    last_sync = time.time()
+                    if not server_connected:
+                        update_lcd(lcd, "System fail", "Code 301")
+                    elif has_student(current_student):
+                        update_lcd(lcd, current_student[:16], "Press button")
+                    else:
+                        update_lcd(lcd, "Choose student", "web")
+                    time.sleep(0.15)
+                sensor_was_pressed = sensor_pressed
 
             if button.is_pressed:
                 beeper.click()
@@ -548,6 +585,11 @@ def main():
         beeper.close()
         try:
             button.close()
+        except Exception:
+            pass
+        try:
+            if student_sensor is not None:
+                student_sensor.close()
         except Exception:
             pass
         cap.release()
