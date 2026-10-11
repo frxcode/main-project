@@ -36,8 +36,6 @@ CREATE TABLE IF NOT EXISTS students (
     created_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_students_teacher ON students(teacher_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_students_fullname_unique
-    ON students (lower(trim(first_name)), lower(trim(last_name)));
 CREATE TABLE IF NOT EXISTS works (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -94,14 +92,44 @@ def full_name_key(first_name: str, last_name: str) -> str:
     return f"{normalize_name_part(first_name).lower()}|{normalize_name_part(last_name).lower()}"
 
 
+def _dedupe_student_full_names():
+    """Залишити одного учня на повне ім'я (найменший id), решту видалити."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, first_name, last_name FROM students ORDER BY id ASC"
+        ).fetchall()
+        seen = {}
+        drop_ids = []
+        for r in rows:
+            key = full_name_key(r["first_name"], r["last_name"])
+            if key in seen:
+                drop_ids.append(r["id"])
+            else:
+                seen[key] = r["id"]
+        for sid in drop_ids:
+            conn.execute("DELETE FROM works WHERE student_id = ?", (sid,))
+            conn.execute("DELETE FROM students WHERE id = ?", (sid,))
+        if drop_ids:
+            conn.commit()
+            print(f"[DB] removed {len(drop_ids)} duplicate full-name students", flush=True)
+
+
 def _ensure_fullname_unique_index():
     """Гарантувати UNIQUE на (first_name, last_name) навіть для старих app.db."""
-    with connect() as conn:
-        conn.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_students_fullname_unique
-               ON students (lower(trim(first_name)), lower(trim(last_name)))"""
-        )
-        conn.commit()
+    for attempt in range(2):
+        _dedupe_student_full_names()
+        try:
+            with connect() as conn:
+                conn.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS idx_students_fullname_unique
+                       ON students (lower(trim(first_name)), lower(trim(last_name)))"""
+                )
+                conn.commit()
+            return
+        except sqlite3.IntegrityError:
+            if attempt == 0:
+                continue
+            raise
 
 
 def find_duplicate_full_name(first_name: str, last_name: str, exclude_id: Optional[int] = None):
