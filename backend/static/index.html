@@ -351,14 +351,24 @@
                 data.students.forEach(s => {
                     const tile = document.createElement('div');
                     tile.className = 'tile student-tile';
-                    tile.dataset.id = s.id;
-                    if (Number(s.id) === Number(data.active_student_id)) tile.classList.add('is-active');
-                    tile.innerHTML = `<div class="tile-avatar">${initials(s.first_name, s.last_name)}</div><div class="tile-name">${escapeHtml(s.first_name)} ${escapeHtml(s.last_name)}</div><button type="button" class="tile-select">Обрати</button>`;
-                    tile.onclick = () => openStudent(s.id, s.first_name, s.last_name);
-                    tile.querySelector('.tile-select').onclick = (event) => {
+                    tile.dataset.id = String(s.id);
+                    const selected = Number(s.id) === Number(data.active_student_id);
+                    if (selected) tile.classList.add('is-active');
+                    tile.innerHTML = `<div class="tile-avatar">${initials(s.first_name, s.last_name)}</div><div class="tile-name">${escapeHtml(s.first_name)} ${escapeHtml(s.last_name)}</div><button type="button" class="tile-select">${selected ? 'Обрано' : 'Обрати'}</button>`;
+                    tile.addEventListener('click', (event) => {
+                        if (event.target.closest('.tile-select')) return;
+                        openStudent(s.id, s.first_name, s.last_name);
+                    });
+                    tile.querySelector('.tile-select').addEventListener('click', async (event) => {
+                        event.preventDefault();
                         event.stopPropagation();
-                        chooseStudent(s.id);
-                    };
+                        const studentId = event.currentTarget.closest('.student-tile').dataset.id;
+                        try {
+                            await chooseStudent(studentId);
+                        } catch (error) {
+                            alert(error.message || 'Не вдалося обрати учня');
+                        }
+                    });
                     grid.appendChild(tile);
                 });
                 fillStudentSelect(document.getElementById('manual-student-select'), data.students, data.active_student_id);
@@ -813,7 +823,10 @@
                     : 'Нікого не обрано';
             }
             document.querySelectorAll('.student-tile').forEach(tile => {
-                tile.classList.toggle('is-active', Number(tile.dataset.id) === Number(activeStudentId));
+                const active = activeStudentId != null && Number(tile.dataset.id) === Number(activeStudentId);
+                tile.classList.toggle('is-active', active);
+                const button = tile.querySelector('.tile-select');
+                if (button) button.textContent = active ? 'Обрано' : 'Обрати';
             });
         }
 

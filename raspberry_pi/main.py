@@ -516,14 +516,9 @@ def main():
         cap.release()
         return
 
-    connected, active_id, active_name = pull_server_selection()
-    if connected and active_id is not None and active_name:
-        student_id, display_name, ready = active_id, active_name, True
-        leds.set_ready()
-        update_lcd(lcd, display_name[:16], "Press button")
-    else:
-        student_id, display_name = reset_session(lcd, leds)
-        ready = False
+    clear_session_on_server()
+    student_id, display_name = reset_session(lcd, leds)
+    ready = False
     last_sync = time.time()
     print("[SYSTEM] Idle", flush=True)
 

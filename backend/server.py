@@ -75,6 +75,12 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 last_pi_sync = 0.0
 
 
+@app.on_event("startup")
+def reset_selected_student_on_startup():
+    """Restart must not keep the previous student. The stand returns to standby."""
+    db.set_active_student_id(None)
+
+
 # ------------------------------- АВТОРИЗАЦІЯ -------------------------------
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
@@ -648,7 +654,9 @@ def analyze_single_photo(student_id: int = Form(...), photo_url: str = Form(...)
     if not target_photo.exists():
         return {"status": "error", "message": "Фото не знайдено"}
 
-    return {"status": "success", "result": run_ai_analysis(target_photo, examples_dir)}
+    result = run_ai_analysis(target_photo, examples_dir)
+    db.set_active_student_id(None)
+    return {"status": "success", "result": result}
 
 
 # ------------------------------- ПРОМПТ (API) -------------------------------
@@ -804,6 +812,7 @@ async def upload_image(
     file_hash = hashlib.md5(contents).hexdigest()
     cached = db.find_work_by_hash(bound_id, file_hash)
     if cached:
+        db.set_active_student_id(None)
         return {
             "status": "success",
             "student_id": bound_id,
@@ -836,7 +845,7 @@ async def upload_image(
         encoding="utf-8",
     )
     db.add_work(bound_id, file_hash, filename, ai_percent, description, timestamp)
-    db.set_active_student_id(bound_id)
+    db.set_active_student_id(None)
 
     return {
         "status": "success",
