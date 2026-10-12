@@ -265,6 +265,10 @@ body {
 }
 
 .student-tile {
+    aspect-ratio: auto;
+    justify-content: flex-start;
+    gap: 8px;
+    padding: 108px 14px 16px;
     background: var(--surface);
     border: 1px solid var(--border);
     box-shadow: var(--shadow-sm);
@@ -278,13 +282,14 @@ body {
     content: "";
     position: absolute;
     inset: 0 0 auto 0;
-    height: 42%;
+    height: 78px;
     background: linear-gradient(135deg, var(--brand-soft) 0%, #f5f8ff 100%);
 }
 
 .student-tile .tile-name {
     position: relative;
-    margin-top: 38px;
+    z-index: 1;
+    margin-top: 0;
     line-height: 1.25;
     font-size: 15px;
     white-space: nowrap;
@@ -296,7 +301,7 @@ body {
 
 .student-tile .tile-avatar {
     position: absolute;
-    top: calc(42% - 26px);
+    top: 52px;
     left: 50%;
     transform: translateX(-50%);
     width: 52px;
@@ -326,7 +331,7 @@ body {
     position: relative;
     z-index: 2;
     flex-shrink: 0;
-    margin-top: 10px;
+    margin-top: 0;
     border: 0;
     border-radius: 999px;
     padding: 6px 12px;
