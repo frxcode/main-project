@@ -608,6 +608,9 @@
                     percentBox.textContent = `${percent}%`;
                     barBox.style.width = `${percent}%`;
                     descBox.textContent = result.description || 'Аналіз завершено.';
+                    if (result.timestamp != null) {
+                        document.getElementById('modal-timestamp').textContent = formatTimestamp(result.timestamp);
+                    }
                 } else {
                     descBox.textContent = data.message || 'Помилка при аналізі ШІ.';
                 }

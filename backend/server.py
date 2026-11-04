@@ -14,10 +14,13 @@ from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import claude_detect
+import claude_ocr
 import db
 import ocr_engine
 import qwen_client
 import translit
+import web_search
 
 app = FastAPI(title="MAN AI Checker API")
 
@@ -53,16 +56,7 @@ SESSION_COOKIE = "session_token"
 SESSION_TTL = 60 * 60 * 24 * 30  # 30 днів
 GMAIL_RE = re.compile(r"^[^\s@]+@gmail\.com$", re.IGNORECASE)
 
-DEFAULT_PROMPT = (
-    "Ти — провідний експерт із цифрової криміналістики, лінгвістики та виявлення академічного плагіату. "
-    "Проведи глибокий аналіз учнівської роботи, зробленої від руки або переписаної з ШІ, і визнач, чи була робота згенерована нейромережею. "
-    "Не вважай, що написаний від руки текст автоматично є доведенням самостійності: учні можуть переписувати готові відповіді з телефона або з ШІ. "
-    "Аналізуй словниковий запас, синтаксис, довжину речень, логіку аргументації, стилістичну однорідність та наявність ознак генерації. "
-    "Порівнюй з характерними ознаками людського письма та ознаками LLM-рефератів. "
-    "Оціни ймовірність використання ШІ у відсотках від 0 до 100. "
-    "Пиши коротко, чітко і структуровано, без води. Опис має бути 1-2 речення або 2-3 короткі тезові фрази. "
-    "Відповідь має бути тільки JSON у форматі: {\"ai_percent\": 15, \"description\": \"Короткий аргументований вердикт українською мовою\"}"
-)
+DEFAULT_PROMPT = claude_detect.DEEP_SYSTEM_PROMPT
 
 AI_SYSTEM_PROMPT = DEFAULT_PROMPT
 
@@ -79,8 +73,11 @@ last_pi_sync = 0.0
 def reset_selected_student_on_startup():
     """Restart must not keep the previous student. The stand returns to standby."""
     db.set_active_student_id(None)
-    # Preload Indra OCR weights (CPU, INDRA_OCR_THREADS cores).
-    ocr_engine.warmup()
+    print(
+        f"[START] claude_ocr={claude_ocr.available()} "
+        f"claude_detect={claude_detect.available()} qwen={qwen_client.available()}",
+        flush=True,
+    )
 
 
 # ------------------------------- АВТОРИЗАЦІЯ -------------------------------
@@ -515,20 +512,17 @@ def delete_photo(student_id: int = Form(...), photo_url: str = Form(...), teache
 
 
 # ------------------------------- АНАЛІЗ ШІ -------------------------------
-NAME_FROM_OCR_PROMPT = (
-    "Ти отримуєш OCR-текст учнівської роботи. "
-    "Знайди прізвище та ім'я учня (зазвичай на початку). "
-    "Поверни кирилицю (якщо видно) і обов'язково латинський трансліт ASCII "
-    "(English/Latin characters only у *_en і display_name — для LCD 16 символів). "
-    "display_name: коротко 'Surname Name' латиницею. "
-    "Не вигадуй ім'я, якщо його немає в тексті. "
-    "Відповідь ТІЛЬКИ JSON без markdown: "
-    '{"first_name":"Ім\'я","last_name":"Прізвище","full_name":"Ім\'я Прізвище",'
-    '"first_name_en":"Name","last_name_en":"Surname","display_name":"Surname Name","found":true} '
-    "Якщо імені немає: "
-    '{"first_name":"","last_name":"","full_name":"","first_name_en":"",'
-    '"last_name_en":"","display_name":"","found":false}.'
-)
+def _short_verdict(text: str, max_words: int = 8, max_chars: int = 64) -> str:
+    """Keep detector explanation tiny for the web layout."""
+    cleaned = " ".join(str(text or "").replace("\n", " ").split())
+    if not cleaned:
+        return ""
+    words = cleaned.split(" ")
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words])
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 1].rstrip(" ,.;:") + "…"
+    return cleaned
 
 
 def _empty_name_result(error: Optional[str] = None) -> dict:
@@ -617,128 +611,329 @@ def _parse_json_response(text_resp: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def run_name_recognition(target_photo_path) -> dict:
-    """Pass 1: local Indra OCR → match name from DB (Qwen only if no DB hit)."""
+def _sidecar_json_path(image_path: Path) -> Path:
+    return image_path.with_suffix(".json")
+
+
+PENDING_DIR = UPLOAD_DIR / "_pending"
+
+
+def _pending_paths(student_id: int) -> tuple[Path, Path]:
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    base = PENDING_DIR / str(int(student_id))
+    return base.with_suffix(".png"), base.with_suffix(".json")
+
+
+def _save_pass1_binding(student_id: int, image_bytes: bytes, recognized: dict) -> Path:
+    """Pass 1: keep photo + bind name fields and document_text separately in sidecar."""
+    img_path, side_path = _pending_paths(student_id)
+    img_path.write_bytes(image_bytes)
+    name_block = {
+        "found": bool(recognized.get("found")),
+        "first_name": str(recognized.get("first_name") or ""),
+        "last_name": str(recognized.get("last_name") or ""),
+        "full_name": str(recognized.get("full_name") or ""),
+        "first_name_en": str(recognized.get("first_name_en") or ""),
+        "last_name_en": str(recognized.get("last_name_en") or ""),
+        "display_name": str(recognized.get("display_name") or ""),
+    }
+    document_text = str(
+        recognized.get("document_text") or recognized.get("ocr_text") or ""
+    ).strip()
+    payload = {
+        "pass": 1,
+        "student_id": int(student_id),
+        "filename": img_path.name,
+        "name": name_block,
+        "document_text": document_text,
+        "ocr_text": document_text,
+        "bound_at": time.time(),
+    }
+    side_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(
+        f"[PASS1] bound student={student_id} name={name_block.get('display_name')!r} "
+        f"chars={len(document_text)} → {img_path.name}",
+        flush=True,
+    )
+    return img_path
+
+
+def _load_pass1_binding(student_id: int, max_age_s: float = 30 * 60) -> dict:
+    """Load Pass-1 name/text binding for this student if still fresh."""
+    _img_path, side_path = _pending_paths(student_id)
+    if not side_path.exists():
+        return {}
     try:
-        ocr_text = ocr_engine.ocr_image(target_photo_path)
+        data = json.loads(side_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    bound_at = float(data.get("bound_at") or 0)
+    if bound_at and (time.time() - bound_at) > max_age_s:
+        return {}
+    return data
+
+
+def _clear_pass1_binding(student_id: int):
+    img_path, side_path = _pending_paths(student_id)
+    for p in (img_path, side_path):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+
+def _write_image_binding(image_path: Path, payload: dict):
+    """Bind analysis/OCR fields to an image via sidecar JSON."""
+    side = _sidecar_json_path(Path(image_path))
+    existing = {}
+    if side.exists():
+        try:
+            existing = json.loads(side.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
+    existing.update(payload or {})
+    existing.setdefault("filename", Path(image_path).name)
+    side.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_bound_ocr_text(image_path: Path) -> str:
+    """Text bound to an image (sidecar JSON), if previously saved."""
+    side = _sidecar_json_path(Path(image_path))
+    if not side.exists():
+        return ""
+    try:
+        data = json.loads(side.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("ocr_text") or data.get("document_text") or "").strip()
+
+
+def _scan_document(path: Path) -> dict:
+    """Claude vision scan; optional Gemini/Indra fallback for document_text only."""
+    if claude_ocr.available():
+        scanned = claude_ocr.scan_image(path)
+        if scanned.get("error") and not scanned.get("document_text"):
+            # Fall through to legacy OCR for body text only.
+            try:
+                text = ocr_engine.ocr_image(path)
+                scanned["document_text"] = text
+                scanned["ocr_text"] = text
+                scanned.pop("error", None)
+            except Exception:
+                pass
+        return scanned
+    try:
+        text = ocr_engine.ocr_image(path)
     except Exception as exc:
         return _empty_name_result(str(exc))
+    matched_name = _match_student_in_ocr_text(text)
+    if matched_name:
+        out = _recognized_from_student(matched_name, ocr_text=text)
+        out["document_text"] = text
+        return out
+    return {
+        "found": False,
+        "first_name": "",
+        "last_name": "",
+        "full_name": "",
+        "first_name_en": "",
+        "last_name_en": "",
+        "display_name": "",
+        "document_text": text,
+        "ocr_text": text,
+    }
 
-    matched = _match_student_in_ocr_text(ocr_text)
-    if matched:
-        return _recognized_from_student(matched, ocr_text=ocr_text)
 
-    if not ocr_text.strip():
-        return _empty_name_result()
+def _portfolio_texts(student: dict, exclude_path: Optional[Path] = None) -> list[str]:
+    """All bound texts for the student: еталони + previous verifier works."""
+    verifier_dir, examples_dir = student_dirs(student)
+    blocks = []
+    exclude = exclude_path.resolve() if exclude_path else None
 
-    if not qwen_client.available():
-        result = _empty_name_result("name not matched in database")
-        result["ocr_text"] = ocr_text
-        return result
+    def add_dir(label: str, folder: Path):
+        if not folder.exists():
+            return
+        idx = 0
+        for name in sorted(os.listdir(folder)):
+            if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            img = folder / name
+            if exclude and img.resolve() == exclude:
+                continue
+            text = _read_bound_ocr_text(img)
+            if not text:
+                scanned = _scan_document(img)
+                text = str(scanned.get("document_text") or scanned.get("ocr_text") or "").strip()
+                if text:
+                    # Bind text to image for next time.
+                    side = _sidecar_json_path(img)
+                    payload = {}
+                    if side.exists():
+                        try:
+                            payload = json.loads(side.read_text(encoding="utf-8"))
+                            if not isinstance(payload, dict):
+                                payload = {}
+                        except Exception:
+                            payload = {}
+                    payload["ocr_text"] = text
+                    payload["document_text"] = text
+                    payload.setdefault("filename", img.name)
+                    side.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            if text:
+                idx += 1
+                blocks.append(f"--- {label} {idx} ({img.name}) ---\n{text}")
 
-    try:
-        text_resp = qwen_client.chat(
+    add_dir("Еталон", examples_dir)
+    add_dir("Портфоліо", verifier_dir)
+    return blocks
+
+
+def run_name_recognition(target_photo_path) -> dict:
+    """Pi Pass 1: Claude scans photo → name JSON → match student in DB."""
+    scanned = _scan_document(Path(target_photo_path))
+    if scanned.get("error") and not scanned.get("found"):
+        return _empty_name_result(str(scanned.get("error")))
+
+    ocr_text = str(scanned.get("document_text") or scanned.get("ocr_text") or "").strip()
+    matched = _match_student_in_ocr_text(
+        " ".join(
             [
-                {"role": "system", "content": NAME_FROM_OCR_PROMPT},
-                {"role": "user", "content": f"OCR-текст роботи:\n{ocr_text[:8000]}"},
-            ],
-            temperature=0.0,
-            timeout=45.0,
+                str(scanned.get("full_name") or ""),
+                str(scanned.get("display_name") or ""),
+                str(scanned.get("first_name") or ""),
+                str(scanned.get("last_name") or ""),
+                str(scanned.get("first_name_en") or ""),
+                str(scanned.get("last_name_en") or ""),
+                ocr_text,
+            ]
         )
-        payload = _parse_json_response(text_resp)
-        first_en = str(payload.get("first_name_en", "") or "").strip()
-        last_en = str(payload.get("last_name_en", "") or "").strip()
-        display = str(payload.get("display_name", "") or "").strip()
-        if not display and (first_en or last_en):
-            display = f"{last_en} {first_en}".strip()
-        return {
-            "found": bool(payload.get("found", bool(payload.get("full_name") or payload.get("last_name")))),
-            "first_name": str(payload.get("first_name", "") or "").strip(),
-            "last_name": str(payload.get("last_name", "") or "").strip(),
-            "full_name": str(payload.get("full_name", "") or "").strip(),
-            "first_name_en": first_en,
-            "last_name_en": last_en,
-            "display_name": display,
-            "ocr_text": ocr_text,
-            "matched_from_db": False,
-        }
-    except Exception as exc:
-        result = _empty_name_result(str(exc))
+    )
+    if matched:
+        out = _recognized_from_student(matched, ocr_text=ocr_text)
+        out["document_text"] = ocr_text
+        return out
+
+    if not scanned.get("found"):
+        result = _empty_name_result()
         result["ocr_text"] = ocr_text
+        result["document_text"] = ocr_text
         return result
 
+    first_en = str(scanned.get("first_name_en") or "").strip()
+    last_en = str(scanned.get("last_name_en") or "").strip()
+    display = str(scanned.get("display_name") or "").strip()
+    if not display and (first_en or last_en):
+        display = f"{last_en} {first_en}".strip()
+    return {
+        "found": True,
+        "first_name": str(scanned.get("first_name") or "").strip(),
+        "last_name": str(scanned.get("last_name") or "").strip(),
+        "full_name": str(scanned.get("full_name") or "").strip(),
+        "first_name_en": first_en,
+        "last_name_en": last_en,
+        "display_name": display,
+        "ocr_text": ocr_text,
+        "document_text": ocr_text,
+        "matched_from_db": False,
+    }
 
-def run_ai_analysis(target_photo_path, examples_dir):
-    """Pass 2 / web analyze: OCR image → send TEXT to Groq (not the photo).
 
-    Photo stays on disk; OCR text is returned and saved next to it.
+def run_ai_analysis(
+    target_photo_path,
+    examples_dir,
+    student: Optional[dict] = None,
+    preferred_text: Optional[str] = None,
+):
+    """Pass 2: bound OCR text + etalons → Claude Sonnet (web_search) → short UI verdict.
+
+    Prefer Pass-1 extracted text when provided; otherwise OCR the saved photo.
+    Does not rely on Qwen for the primary check.
     """
-    example_photos = []
-    if examples_dir.exists():
-        example_photos = [
-            examples_dir / filename
-            for filename in sorted(os.listdir(examples_dir))
-            if filename.lower().endswith((".png", ".jpg", ".jpeg"))
-        ]
-
-    try:
-        work_text = ocr_engine.ocr_image(target_photo_path)
-    except Exception as exc:
-        return {"ai_percent": 0, "description": f"Помилка OCR фото: {exc}", "ocr_text": ""}
-
-    if not work_text.strip():
+    target = Path(target_photo_path)
+    work_text = (preferred_text or "").strip()
+    if not work_text:
+        work_text = _read_bound_ocr_text(target)
+    if not work_text:
+        scanned = _scan_document(target)
+        work_text = str(scanned.get("document_text") or scanned.get("ocr_text") or "").strip()
+        if scanned.get("error") and not work_text:
+            return {
+                "ai_percent": 0,
+                "description": f"Помилка OCR фото: {scanned.get('error')}",
+                "ocr_text": "",
+            }
+    if not work_text:
         return {
             "ai_percent": 0,
             "description": "OCR не знайшов текст на фото роботи",
             "ocr_text": "",
         }
 
-    example_blocks = []
-    for idx, ex in enumerate(example_photos, start=1):
-        try:
-            ex_text = ocr_engine.ocr_image(ex)
-        except Exception:
-            continue
-        if ex_text.strip():
-            example_blocks.append(f"--- Еталон {idx} ---\n{ex_text}")
+    # Keep text bound to this image for portfolio / re-analyze.
+    _write_image_binding(
+        target,
+        {
+            "document_text": work_text,
+            "ocr_text": work_text,
+            "pass": 2,
+            "bound_at": time.time(),
+        },
+    )
 
-    user_parts = []
-    if example_blocks:
-        user_parts.append("Еталонні роботи учня (OCR-текст):")
-        user_parts.extend(example_blocks)
+    portfolio_blocks = []
+    if student:
+        portfolio_blocks = _portfolio_texts(student, exclude_path=target)
     else:
-        user_parts.append("Увага: еталонних робіт немає, оцінюй за загальними критеріями.")
-    user_parts.append("Робота для перевірки (OCR-текст):")
-    user_parts.append(work_text)
+        if examples_dir and Path(examples_dir).exists():
+            for idx, name in enumerate(
+                sorted(
+                    n
+                    for n in os.listdir(examples_dir)
+                    if n.lower().endswith((".png", ".jpg", ".jpeg"))
+                ),
+                start=1,
+            ):
+                img = Path(examples_dir) / name
+                text = _read_bound_ocr_text(img) or str(_scan_document(img).get("document_text") or "")
+                if text.strip():
+                    portfolio_blocks.append(f"--- Еталон {idx} ({name}) ---\n{text.strip()}")
+
+    print(
+        f"[PASS2] Claude detect chars={len(work_text)} etalons={len(portfolio_blocks)} "
+        f"web_search=1",
+        flush=True,
+    )
+    if not claude_detect.available():
+        return {
+            "ai_percent": 0,
+            "description": _short_verdict("Claude недоступний"),
+            "ocr_text": work_text,
+        }
 
     try:
-        text_resp = qwen_client.chat(
-            [
-                {"role": "system", "content": load_prompt()},
-                {"role": "user", "content": "\n\n".join(user_parts)[:24000]},
-            ],
-            temperature=0.2,
-            timeout=90.0,
+        result = claude_detect.detect_deep(
+            work_text,
+            portfolio_blocks=portfolio_blocks,
+            system_prompt=load_prompt(),
+            use_web_search=True,
         )
-        if not text_resp:
-            return {
-                "ai_percent": 0,
-                "description": "Groq повернув порожню відповідь",
-                "ocr_text": work_text,
-            }
-
-        payload = _parse_json_response(text_resp)
-        if not payload:
-            payload = {"ai_percent": 0, "description": text_resp}
         return {
-            "ai_percent": int(payload.get("ai_percent", 0) or 0),
-            "description": str(payload.get("description", "")),
+            "ai_percent": int(result.get("ai_percent", 0) or 0),
+            "description": _short_verdict(str(result.get("description", ""))),
             "ocr_text": work_text,
         }
     except Exception as exc:
+        print(f"[PASS2] Claude deep failed: {exc}", flush=True)
         return {
             "ai_percent": 0,
-            "description": f"Помилка аналізу ШІ: {exc}",
+            "description": _short_verdict(f"Помилка Claude: {exc}"),
             "ocr_text": work_text,
         }
 
@@ -754,8 +949,38 @@ def analyze_single_photo(student_id: int = Form(...), photo_url: str = Form(...)
     if not target_photo.exists():
         return {"status": "error", "message": "Фото не знайдено"}
 
-    result = run_ai_analysis(target_photo, examples_dir)
+    result = run_ai_analysis(target_photo, examples_dir, student=student)
+    ai_percent = int(result.get("ai_percent", 0) or 0)
+    description = str(result.get("description", "") or "")
+    ocr_text = str(result.get("ocr_text", "") or "")
+    timestamp = time.time()
+    file_hash = target_photo.stem
+    filename = target_photo.name
+
+    verdict_payload = {
+        "student_id": int(student["id"]),
+        "student_name": full_name(student),
+        "filename": filename,
+        "file_hash": file_hash,
+        "ai_percent": ai_percent,
+        "description": description,
+        "ocr_text": ocr_text,
+        "document_text": ocr_text,
+        "timestamp": timestamp,
+    }
+    (verifier_dir / f"{file_hash}.json").write_text(
+        json.dumps(verdict_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    db.add_work(int(student["id"]), file_hash, filename, ai_percent, description, timestamp)
     db.set_active_student_id(None)
+    result = {
+        **result,
+        "ai_percent": ai_percent,
+        "description": description,
+        "ocr_text": ocr_text,
+        "timestamp": timestamp,
+    }
     return {"status": "success", "result": result}
 
 
@@ -829,9 +1054,9 @@ def _display_name_latin(recognized: dict, student) -> str:
 
 @app.post("/api/pi/recognize_student")
 async def recognize_student(file: UploadFile = File(...)):
-    """Pi Pass 1 only: OCR photo → match student in DB → show name on LCD.
+    """Pi Pass 1: OCR photo → separate name + document_text → bind to image → LCD name.
 
-    Does NOT run AI %. Pass 2 is /upload/ after the second button press.
+    Does NOT run AI %. Pass 2 (/upload/) uses the bound text + etalons with Claude.
     """
     global last_pi_sync
     last_pi_sync = time.time()
@@ -876,6 +1101,8 @@ async def recognize_student(file: UploadFile = File(...)):
     if not student:
         return {"status": "not_found", "message": "student not in database", "recognized": recognized}
 
+    # Bind Pass-1 photo + separated name/text for Pass-2 Claude check.
+    _save_pass1_binding(int(student["id"]), contents, recognized)
     db.set_active_student_id(student["id"])
     return {
         "status": "success",
@@ -883,6 +1110,10 @@ async def recognize_student(file: UploadFile = File(...)):
         "student_name": full_name(student),
         "display_name": _display_name_latin(recognized, student),
         "recognized": recognized,
+        "document_text_chars": len(
+            str(recognized.get("document_text") or recognized.get("ocr_text") or "")
+        ),
+        "pass": 1,
     }
 
 
@@ -892,9 +1123,9 @@ async def upload_image(
     file: UploadFile = File(...),
     student_id: Optional[int] = Form(None),
 ):
-    """Pi Pass 2: save photo, OCR → text, send TEXT to Groq with prompt.
+    """Pi Pass 2 (second button): bound Pass-1 text + etalons → Claude Sonnet web_search.
 
-    Image is stored on disk; OCR text is saved in the sidecar JSON next to it.
+    Saves the Pass-2 photo, reuses Pass-1 extracted text when available, returns a short phrase.
     """
     if student_id is None and request.query_params.get("student_id"):
         try:
@@ -919,6 +1150,7 @@ async def upload_image(
     cached = db.find_work_by_hash(bound_id, file_hash)
     if cached:
         db.set_active_student_id(None)
+        _clear_pass1_binding(bound_id)
         cached_ocr = ""
         sidecar = verifier_dir / f"{file_hash}.json"
         if sidecar.exists():
@@ -934,20 +1166,31 @@ async def upload_image(
             "description": cached["description"],
             "ocr_text": cached_ocr,
             "cached": True,
+            "pass": 2,
         }
 
     filename = f"{file_hash}.png"
     save_path = verifier_dir / filename
     save_path.write_bytes(contents)
 
-    ai_result = run_ai_analysis(save_path, examples_dir)
+    # Prefer Pass-1 bound document_text (name was stored separately).
+    pending = _load_pass1_binding(bound_id)
+    preferred_text = str(pending.get("document_text") or pending.get("ocr_text") or "").strip()
+    pending_name = pending.get("name") if isinstance(pending.get("name"), dict) else {}
+
+    ai_result = run_ai_analysis(
+        save_path,
+        examples_dir,
+        student=student,
+        preferred_text=preferred_text or None,
+    )
     ai_percent = int(ai_result.get("ai_percent", 0))
     description = str(ai_result.get("description", ""))
     ocr_text = str(ai_result.get("ocr_text", "") or "")
     timestamp = time.time()
 
-    # Image file + sibling JSON = photo bound to OCR text + verdict.
     verdict_payload = {
+        "pass": 2,
         "student_id": bound_id,
         "student_name": full_name(student),
         "filename": filename,
@@ -955,13 +1198,15 @@ async def upload_image(
         "ai_percent": ai_percent,
         "description": description,
         "ocr_text": ocr_text,
+        "document_text": ocr_text,
+        "name": pending_name,
+        "from_pass1_text": bool(preferred_text),
+        "detector": "claude-sonnet-5-5+web_search",
         "timestamp": timestamp,
     }
-    (verifier_dir / f"{file_hash}.json").write_text(
-        json.dumps(verdict_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _write_image_binding(save_path, verdict_payload)
     db.add_work(bound_id, file_hash, filename, ai_percent, description, timestamp)
+    _clear_pass1_binding(bound_id)
     db.set_active_student_id(None)
 
     return {
@@ -972,6 +1217,8 @@ async def upload_image(
         "description": description,
         "ocr_text": ocr_text,
         "cached": False,
+        "pass": 2,
+        "from_pass1_text": bool(preferred_text),
     }
 
 

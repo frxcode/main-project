@@ -11,7 +11,12 @@ module.exports = {
     restart_delay: 2000,
     env: {
       PYTHONUNBUFFERED: '1',
-      INDRA_OCR_THREADS: '10'
+      INDRA_OCR_THREADS: '10',
+      OCR_BACKEND: 'claude',
+      CLAUDE_OCR_MODEL: 'claude-sonnet-5-5',
+      CLAUDE_DETECT_MODEL: 'claude-sonnet-5-5',
+      DETECT_BACKEND: 'claude',
+      QWEN_WEB_SEARCH: '1'
     }
   }]
 };

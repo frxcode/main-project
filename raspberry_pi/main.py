@@ -463,7 +463,8 @@ def pass2_analyze(
             f"{SERVER_URL}/upload/",
             data={"student_id": str(student_id)},
             files={"file": ("work.png", photo, "image/png")},
-            timeout=60,
+            # Claude Sonnet + web_search on pass 2 can exceed 60s.
+            timeout=180,
         )
     except requests.RequestException:
         update_lcd(lcd, "Network fail", "Code 500")
