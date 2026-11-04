@@ -1,4 +1,4 @@
-"""Claude Sonnet vision OCR: name + document text as JSON (image stays separate)."""
+"""Claude Sonnet vision: Pass 1 name-only scan (image stays separate)."""
 
 from __future__ import annotations
 
@@ -12,9 +12,10 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Union
 
-CLAUDE_SCAN_PROMPT = (
-    "You OCR a photo of a student paper. The page may be rotated.\n"
-    "Return ONLY JSON (no markdown) with:\n"
+CLAUDE_NAME_PROMPT = (
+    "You read a photo of a student paper. The page may be rotated.\n"
+    "Extract ONLY the student name visible on the page. Do NOT OCR the homework body.\n"
+    "Return ONLY JSON (no markdown):\n"
     "{\n"
     '  "found": true/false,\n'
     '  "first_name": "",\n'
@@ -22,16 +23,16 @@ CLAUDE_SCAN_PROMPT = (
     '  "full_name": "",\n'
     '  "first_name_en": "Latin ASCII",\n'
     '  "last_name_en": "Latin ASCII",\n'
-    '  "display_name": "Surname Name",\n'
-    '  "document_text": "full body text of the work in original language"\n'
+    '  "display_name": "Surname Name"\n'
     "}\n"
     "Rules:\n"
-    "- found=true only if a real student name is visible on the page.\n"
+    "- found=true only if a real student name is visible.\n"
     "- first_name_en/last_name_en/display_name must be Latin ASCII for a 16-char LCD.\n"
-    "- document_text: complete homework text, reading order, original language "
-    "(Ukrainian/Russian/English). Do not summarize.\n"
-    "- If name is missing: found=false and empty name fields, but still fill document_text.\n"
+    "- Ignore homework body text entirely.\n"
 )
+
+# Back-compat alias
+CLAUDE_SCAN_PROMPT = CLAUDE_NAME_PROMPT
 
 
 def _cfg():
@@ -85,8 +86,8 @@ def _empty(error: Optional[str] = None) -> dict:
     return out
 
 
-def scan_image(path: Union[str, Path]) -> dict:
-    """Vision OCR via Claude: separate name fields + document_text."""
+def scan_name(path: Union[str, Path]) -> dict:
+    """Pass 1: vision name extraction only (no homework body OCR)."""
     api_key, model = _cfg()
     if not api_key:
         return _empty("ANTHROPIC_API_KEY / CLAUDE_API_KEY is not set")
@@ -96,7 +97,7 @@ def scan_image(path: Union[str, Path]) -> dict:
     b64 = base64.standard_b64encode(raw).decode("ascii")
     payload = {
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": 512,
         "messages": [
             {
                 "role": "user",
@@ -109,11 +110,11 @@ def scan_image(path: Union[str, Path]) -> dict:
                             "data": b64,
                         },
                     },
-                    {"type": "text", "text": CLAUDE_SCAN_PROMPT},
+                    {"type": "text", "text": CLAUDE_NAME_PROMPT},
                 ],
             }
         ],
-        "output_config": {"effort": "medium"},
+        "output_config": {"effort": "low"},
     }
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -127,7 +128,7 @@ def scan_image(path: Union[str, Path]) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=45) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:800]
@@ -141,9 +142,8 @@ def scan_image(path: Union[str, Path]) -> dict:
             parts.append(block.get("text") or "")
     parsed = _parse_json("\n".join(parts))
     if not parsed:
-        return _empty("Claude returned non-JSON OCR payload")
+        return _empty("Claude returned non-JSON name payload")
 
-    doc = str(parsed.get("document_text") or parsed.get("ocr_text") or "").strip()
     first_en = str(parsed.get("first_name_en") or "").strip()
     last_en = str(parsed.get("last_name_en") or "").strip()
     display = str(parsed.get("display_name") or "").strip()
@@ -158,13 +158,18 @@ def scan_image(path: Union[str, Path]) -> dict:
         "first_name_en": first_en,
         "last_name_en": last_en,
         "display_name": display,
-        "document_text": doc,
-        "ocr_text": doc,
+        "document_text": "",
+        "ocr_text": "",
     }
-    print(f"[OCR] claude model={model} chars={len(doc)} found={result['found']}", flush=True)
+    print(f"[OCR] name-only model={model} found={result['found']} display={display!r}", flush=True)
     return result
 
 
+def scan_image(path: Union[str, Path]) -> dict:
+    """Back-compat: Pass 1 name-only (no body OCR)."""
+    return scan_name(path)
+
+
 def document_text(path: Union[str, Path]) -> str:
-    """Convenience: only the homework body text."""
-    return str(scan_image(path).get("document_text") or "").strip()
+    """Deprecated for Pass 2 — body is not OCR'd on Pass 1."""
+    return ""

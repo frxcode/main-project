@@ -1,37 +1,44 @@
-"""Deep Claude Sonnet AI-writing detector (text after OCR) with live web search."""
+"""Pass-2 Claude Sonnet vision AI detector: analyze the IMAGE (not OCR text)."""
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import re
 import urllib.error
 import urllib.request
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional, Union
 
-import style_signals
-import web_search
+DEEP_SYSTEM_PROMPT = """Ти — максимально агресивний криміналістичний детектор AI-письма для учнівських робіт (UA/EN/RU).
+Мета: майже напевно виявити AI (ChatGPT/Claude/Gemini/Qwen тощо), включно з сильним «humanize». Типові м'які детектори ставлять ~15–30% на очевидний AI — ТИ НЕ МАЄШ так робити.
 
-DEEP_SYSTEM_PROMPT = """Ти — суворий криміналістичний детектор AI-тексту для учнівських робіт (UA/EN/RU).
-Мета: виявити навіть сильно «humanized» AI (ChatGPT, Claude, Gemini, Qwen тощо), який інші детектори занижують до ~15%.
+АНАЛІЗУЙ ЗОБРАЖЕННЯ РОБОТИ (vision), не OCR-рядок.
+Критерії (зміст і стиль письма, НЕ вигляд носія):
+1) Лексика: кліше, «академічний глянець», слабкий особистий голос, шаблонні мости.
+2) Ритм: рівномірні речення, низька burstiness, передбачувана структура.
+3) Семантика: порожні узагальнення, списки переваг/недоліків без живого досвіду учня.
+4) Факти: використовуй web_search для підозрілих тверджень/дат/цитат; галюцинації → дуже високий %.
+5) Порівняй з еталонними ФОТО робіт учня (якщо є): різкий стрибок «глянцю» = AI.
+6) Патерни LLM + humanize (штучна «розхристаність» при тому ж рівному ритмі).
 
-ГЛИБОКИЙ АНАЛІЗ (внутрішньо, слово-за-словом і фраза-за-фразою; у відповідь НЕ виливай довгий звіт):
-1) Лексика: шаблонні кліше, «академічний глянець», відсутність особистого голосу.
-2) Синтаксис / ритм: рівномірна довжина речень, низька burstiness, передбачувані переходи.
-3) Статистика: використай локальні метрики (TTR, burstiness, hapax, 3-грами, AI-переходи).
-4) Семантика: порожні узагальнення без конкретики учня.
-5) Факти: ОБОВ'ЯЗКОВО використай інструмент web_search для підозрілих тверджень, імен, дат, цитат, «досліджень». Звірь з відкритими джерелами. Галюцинації / неіснуючі джерела → підвищуй %.
-6) Портфоліо: різкий стрибок стилю vs еталони = підозра.
-7) Патерни моделей + humanize-сервіси (штучні скорочення при рівному ритмі).
-8) OCR-помилки ≠ сленг і ≠ «людяність».
+ЖОРСТКІ ЗАБОРОНИ (не чіпай оцінку через це):
+- OCR-помилки / криві літери / артефакти фото / шум скану → ІГНОРУЙ. Це НЕ сигнал AI і НЕ сигнал людини.
+- Друкований / набраний / рукописний текст → ІГНОРУЙ як фактор. Учень може переписати ChatGPT від руки або набрати. Формат носія = 0 впливу на ai_percent.
 
-ШКАЛА (не занижуй «бо humanize»):
-- 90–100 явні LLM-маркери; 75–89 гладкий AI/humanize; 60–74 сильні стат/стиль сигнали;
-- 45–59 мікс; 0–35 справжнє учнівське. Сильні AI-сигнали → не нижче 60.
+ШКАЛА (агресивна; не давай «знижки за humanize»):
+- 92–100: явний LLM / шаблон / humanize з рівним ритмом (майже напевно AI)
+- 80–91: сильні LLM-ознаки, навіть без кліше
+- 65–79: переконливі AI-сигнали / ймовірна допомога ШІ
+- 40–64: мікс
+- 0–35: справді нерівне учнівське письмо без LLM-глянцю
+Якщо є кілька сильних AI-ознак — став ≥90. Краще трохи завищити AI, ніж пропустити.
 
-ВІДПОВІДЬ: лише один JSON-об'єкт, без markdown:
-{"ai_percent":85,"description":"шаблонний humanize","signals":["burstiness low","web mismatch"]}
-description = 3–8 слів українською для UI. signals = короткі внутрішні мітки."""
+ВІДПОВІДЬ лише JSON:
+{"ai_percent":95,"description":"явний LLM шаблон","signals":["uniform rhythm","generic phrasing"],"normalized_content":"короткий нормалізований зміст роботи для кешу"}
+description = 3–8 слів українською. normalized_content = plain text змісту (без OCR-сміття), для кешу однакових робіт."""
 
 
 def _cfg():
@@ -47,6 +54,11 @@ def _cfg():
 def available() -> bool:
     api_key, _model = _cfg()
     return bool(api_key)
+
+
+def _mime(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    return mime or "image/png"
 
 
 def _parse_json(text: str) -> dict:
@@ -66,11 +78,22 @@ def _parse_json(text: str) -> dict:
 def _collect_text(content) -> str:
     parts = []
     for block in content or []:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text":
+        if isinstance(block, dict) and block.get("type") == "text":
             parts.append(block.get("text") or "")
     return "\n".join(parts)
+
+
+def _image_block(path: Path) -> dict:
+    raw = path.read_bytes()
+    b64 = base64.standard_b64encode(raw).decode("ascii")
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": _mime(path),
+            "data": b64,
+        },
+    }
 
 
 def _api_call(payload: dict, api_key: str, timeout: float) -> dict:
@@ -93,63 +116,112 @@ def _api_call(payload: dict, api_key: str, timeout: float) -> dict:
         raise RuntimeError(f"Claude detect HTTP {exc.code}: {detail}") from exc
 
 
-def analyze_text(
-    system_prompt: str,
-    user_content: str,
-    timeout: float = 150.0,
+def detect_image(
+    work_image: Union[str, Path],
+    etalon_images: Optional[List[Union[str, Path]]] = None,
+    system_prompt: Optional[str] = None,
     use_web_search: bool = True,
+    timeout: float = 52.0,
 ) -> dict:
-    """Return {"ai_percent": int, "description": str, "signals": list} from Claude."""
+    """
+    Pass 2: send the homework IMAGE (+ optional etalon images) to Claude.
+    Never score from OCR text — OCR artifacts must not affect ai_percent.
+    """
     api_key, model = _cfg()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY / CLAUDE_API_KEY is not set")
 
-    # Sonnet 5.5: no temperature; effort + optional server-side web_search.
+    work_path = Path(work_image)
+    if not work_path.exists():
+        return {"ai_percent": 0, "description": "немає фото", "signals": [], "normalized_content": ""}
+
+    content: list = [
+        _image_block(work_path),
+        {
+            "type": "text",
+            "text": (
+                "PASS 2. Це ФОТО роботи для перевірки на AI (не OCR-текст).\n"
+                "Ігноруй OCR/шум/рукопис vs друк. Оцінюй лише зміст і стиль письма.\n"
+                "Будь агресивним: очевидний AI → 92–100. description 3–8 слів."
+            ),
+        },
+    ]
+
+    etalons = [Path(p) for p in (etalon_images or []) if Path(p).exists()][:4]
+    for idx, ep in enumerate(etalons, start=1):
+        content.append(_image_block(ep))
+        content.append(
+            {
+                "type": "text",
+                "text": f"Еталон/портфоліо фото #{idx} ({ep.name}) — для порівняння стилю учня.",
+            }
+        )
+    if not etalons:
+        content.append(
+            {
+                "type": "text",
+                "text": "Еталонних фото немає — оцінюй лише роботу за LLM-ознаками + web_search.",
+            }
+        )
+
+    if system_prompt and len(system_prompt.strip()) > 200 and system_prompt.strip() != DEEP_SYSTEM_PROMPT:
+        prompt = DEEP_SYSTEM_PROMPT + "\n\nДодаткові вказівки вчителя:\n" + system_prompt.strip()
+    else:
+        prompt = DEEP_SYSTEM_PROMPT
+
     tools = []
     if use_web_search:
         tools.append(
             {
                 "type": "web_search_20260318",
                 "name": "web_search",
-                # Keep Pass-2 under the Pi client's existing 60s upload timeout.
                 "max_uses": 3,
             }
         )
 
-    messages = [{"role": "user", "content": user_content[:70000]}]
+    messages = [{"role": "user", "content": content}]
     payload = {
         "model": model,
         "max_tokens": 1200,
-        "system": system_prompt,
+        "system": prompt,
         "messages": messages,
-        # medium: deep enough, fits Pi's unchanged 60s HTTP timeout.
         "output_config": {"effort": "medium"},
     }
     if tools:
         payload["tools"] = tools
 
-    # Server tools may pause_turn; continue a few rounds with the same tools.
     body = None
-    for round_i in range(4):
-        body = _api_call(payload, api_key, timeout=timeout)
-        stop = body.get("stop_reason")
-        content = body.get("content") or []
-        print(
-            f"[DETECT] claude round={round_i} stop={stop} model={model} "
-            f"blocks={len(content)}",
-            flush=True,
-        )
-        if stop != "pause_turn":
-            break
-        # Continue: append assistant content and ask model to finish JSON.
-        messages.append({"role": "assistant", "content": content})
-        messages.append(
-            {
-                "role": "user",
-                "content": "Продовж аналіз і поверни фінальний JSON з ai_percent і description.",
-            }
-        )
-        payload["messages"] = messages
+    try:
+        for round_i in range(3):
+            body = _api_call(payload, api_key, timeout=timeout)
+            stop = body.get("stop_reason")
+            blocks = body.get("content") or []
+            print(
+                f"[DETECT] vision round={round_i} stop={stop} model={model} "
+                f"etalons={len(etalons)} blocks={len(blocks)}",
+                flush=True,
+            )
+            if stop != "pause_turn":
+                break
+            messages.append({"role": "assistant", "content": blocks})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Поверни фінальний JSON з ai_percent, description, normalized_content.",
+                }
+            )
+            payload["messages"] = messages
+    except RuntimeError as exc:
+        if use_web_search and "web search" in str(exc).lower():
+            print(f"[DETECT] web_search unavailable, retry without: {exc}", flush=True)
+            return detect_image(
+                work_image,
+                etalon_images=etalon_images,
+                system_prompt=system_prompt,
+                use_web_search=False,
+                timeout=timeout,
+            )
+        raise
 
     parsed = _parse_json(_collect_text((body or {}).get("content")))
     if not parsed:
@@ -157,16 +229,27 @@ def analyze_text(
             f"Claude detect non-JSON: {_collect_text((body or {}).get('content'))[:400]}"
         )
 
-    pct = int(parsed.get("ai_percent", 0) or 0)
-    pct = max(0, min(100, pct))
+    pct = max(0, min(100, int(parsed.get("ai_percent", 0) or 0)))
+    # Aggressive post-floor: clear mid-high scores that models soft-ball → push up.
+    if pct >= 55 and pct < 80:
+        pct = max(pct, 82)
+    elif pct >= 40 and pct < 55:
+        pct = max(pct, 70)
     desc = str(parsed.get("description", "") or "").strip()
     signals = parsed.get("signals") or []
     if not isinstance(signals, list):
         signals = [str(signals)]
+    signals = list(signals) + ["vision_image", "format_ignored", "ocr_ignored"]
     if use_web_search:
-        signals = list(signals) + ["web_search_enabled"]
-    print(f"[DETECT] claude model={model} ai_percent={pct} signals={signals[:8]}", flush=True)
-    return {"ai_percent": pct, "description": desc, "signals": signals}
+        signals.append("web_search_enabled")
+    norm = str(parsed.get("normalized_content") or "").strip()
+    print(f"[DETECT] vision ai_percent={pct} signals={signals[:8]}", flush=True)
+    return {
+        "ai_percent": pct,
+        "description": desc,
+        "signals": signals,
+        "normalized_content": norm,
+    }
 
 
 def detect_deep(
@@ -175,82 +258,12 @@ def detect_deep(
     system_prompt: Optional[str] = None,
     use_web_search: bool = True,
 ) -> dict:
-    """
-    Pass-2 forensic detector: style stats + optional local research pack +
-    Claude Sonnet with native web_search tool + etalon portfolio.
-    UI gets only a short description.
-    """
-    work_text = (work_text or "").strip()
-    if not work_text:
-        return {"ai_percent": 0, "description": "немає тексту", "signals": []}
-
-    stats = style_signals.compute(work_text)
-    stats_block = style_signals.format_for_prompt(stats)
-
-    # Skip slow local DDG/wiki crawl when Claude has live web_search (fits Pi 60s timeout).
-    web_ctx = ""
-    if not use_web_search:
-        try:
-            web_ctx = web_search.research_for_detector(work_text)
-        except Exception as exc:
-            print(f"[DETECT] local web research skipped: {exc}", flush=True)
-
-    user_parts = [
-        "Це PASS 2 глибокої перевірки. Текст уже витягнуто з фото (OCR) і прив'язано до зображення.",
-        "Порівняй з еталонами. Для фактів використовуй web_search.",
-        "У JSON лише короткий description (3–8 слів).",
-        stats_block,
-    ]
-    if web_ctx:
-        user_parts.append("Додатковий локальний веб/wiki контекст (орієнтир):\n" + web_ctx)
-    if portfolio_blocks:
-        user_parts.append("Еталони / портфоліо учня:")
-        user_parts.extend(portfolio_blocks)
-    else:
-        user_parts.append("Еталонів немає — оцінюй за стилем, статистикою та веб-фактчеком.")
-    user_parts.append("Текст роботи для перевірки:")
-    user_parts.append(work_text)
-
-    if system_prompt and len(system_prompt.strip()) > 200 and system_prompt.strip() != DEEP_SYSTEM_PROMPT:
-        prompt = DEEP_SYSTEM_PROMPT + "\n\nДодаткові вказівки вчителя:\n" + system_prompt.strip()
-    else:
-        prompt = DEEP_SYSTEM_PROMPT
-
-    try:
-        result = analyze_text(
-            prompt,
-            "\n\n".join(user_parts),
-            # Pi /upload/ timeout is 60s; leave headroom for network + JSON parse.
-            timeout=52.0,
-            use_web_search=use_web_search,
-        )
-    except RuntimeError as exc:
-        # If org disabled web search, retry without the tool.
-        if use_web_search and "web search" in str(exc).lower():
-            print(f"[DETECT] web_search tool unavailable, retry without: {exc}", flush=True)
-            result = analyze_text(
-                prompt,
-                "\n\n".join(user_parts),
-                timeout=120.0,
-                use_web_search=False,
-            )
-        else:
-            raise
-
-    hint = int(stats.get("local_suspicion_hint") or 0)
-    pct = int(result.get("ai_percent") or 0)
-    if hint >= 55 and pct < 60:
-        pct = max(pct, min(78, hint + 10))
-        result["ai_percent"] = pct
-        signals = list(result.get("signals") or [])
-        signals.append("local_floor_applied")
-        result["signals"] = signals
-        print(f"[DETECT] local floor → ai_percent={pct} (hint={hint})", flush=True)
-    elif hint >= 40 and pct < 45:
-        pct = max(pct, 55)
-        result["ai_percent"] = pct
-        signals = list(result.get("signals") or [])
-        signals.append("local_floor_soft")
-        result["signals"] = signals
-    result["style_stats"] = stats
-    return result
+    """Legacy text path — prefer detect_image. Kept for rare fallbacks only."""
+    # Text path is discouraged (OCR text biases the model). Return soft refusal to force image path.
+    _ = (work_text, portfolio_blocks, system_prompt, use_web_search)
+    return {
+        "ai_percent": 0,
+        "description": "потрібне фото не текст",
+        "signals": ["text_path_disabled"],
+        "normalized_content": "",
+    }

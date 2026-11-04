@@ -19,6 +19,7 @@ import claude_ocr
 import db
 import ocr_engine
 import qwen_client
+import text_cache
 import translit
 import web_search
 
@@ -62,6 +63,7 @@ AI_SYSTEM_PROMPT = DEFAULT_PROMPT
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 db.init_db()
+text_cache.init(UPLOAD_DIR)
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
@@ -625,7 +627,7 @@ def _pending_paths(student_id: int) -> tuple[Path, Path]:
 
 
 def _save_pass1_binding(student_id: int, image_bytes: bytes, recognized: dict) -> Path:
-    """Pass 1: keep photo + bind name fields and document_text separately in sidecar."""
+    """Pass 1: keep photo + bind NAME only (no homework OCR)."""
     img_path, side_path = _pending_paths(student_id)
     img_path.write_bytes(image_bytes)
     name_block = {
@@ -637,22 +639,17 @@ def _save_pass1_binding(student_id: int, image_bytes: bytes, recognized: dict) -
         "last_name_en": str(recognized.get("last_name_en") or ""),
         "display_name": str(recognized.get("display_name") or ""),
     }
-    document_text = str(
-        recognized.get("document_text") or recognized.get("ocr_text") or ""
-    ).strip()
     payload = {
         "pass": 1,
         "student_id": int(student_id),
         "filename": img_path.name,
         "name": name_block,
-        "document_text": document_text,
-        "ocr_text": document_text,
         "bound_at": time.time(),
     }
     side_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"[PASS1] bound student={student_id} name={name_block.get('display_name')!r} "
-        f"chars={len(document_text)} → {img_path.name}",
+        f"[PASS1] name-only bound student={student_id} "
+        f"name={name_block.get('display_name')!r} → {img_path.name}",
         flush=True,
     )
     return img_path
@@ -715,116 +712,87 @@ def _read_bound_ocr_text(image_path: Path) -> str:
     return str(data.get("ocr_text") or data.get("document_text") or "").strip()
 
 
-def _scan_document(path: Path) -> dict:
-    """Claude vision scan; optional Gemini/Indra fallback for document_text only."""
+def _scan_name(path: Path) -> dict:
+    """Pass 1: name-only vision scan (no homework body OCR)."""
     if claude_ocr.available():
-        scanned = claude_ocr.scan_image(path)
-        if scanned.get("error") and not scanned.get("document_text"):
-            # Fall through to legacy OCR for body text only.
-            try:
-                text = ocr_engine.ocr_image(path)
-                scanned["document_text"] = text
-                scanned["ocr_text"] = text
-                scanned.pop("error", None)
-            except Exception:
-                pass
-        return scanned
+        return claude_ocr.scan_name(path)
+    # Last resort: legacy OCR blob → try to match a name in DB (not used for AI %).
     try:
         text = ocr_engine.ocr_image(path)
     except Exception as exc:
         return _empty_name_result(str(exc))
     matched_name = _match_student_in_ocr_text(text)
     if matched_name:
-        out = _recognized_from_student(matched_name, ocr_text=text)
-        out["document_text"] = text
-        return out
-    return {
-        "found": False,
-        "first_name": "",
-        "last_name": "",
-        "full_name": "",
-        "first_name_en": "",
-        "last_name_en": "",
-        "display_name": "",
-        "document_text": text,
-        "ocr_text": text,
-    }
+        return _recognized_from_student(matched_name, ocr_text="")
+    return _empty_name_result()
 
 
-def _portfolio_texts(student: dict, exclude_path: Optional[Path] = None) -> list[str]:
-    """All bound texts for the student: еталони + previous verifier works."""
+def _portfolio_images(student: dict, exclude_path: Optional[Path] = None, limit: int = 4) -> list[Path]:
+    """Etalon + portfolio IMAGE paths for Pass-2 vision compare (not OCR text)."""
     verifier_dir, examples_dir = student_dirs(student)
-    blocks = []
     exclude = exclude_path.resolve() if exclude_path else None
+    out: list[Path] = []
 
-    def add_dir(label: str, folder: Path):
+    def add_dir(folder: Path):
         if not folder.exists():
             return
-        idx = 0
         for name in sorted(os.listdir(folder)):
             if not name.lower().endswith((".png", ".jpg", ".jpeg")):
                 continue
             img = folder / name
             if exclude and img.resolve() == exclude:
                 continue
-            text = _read_bound_ocr_text(img)
-            if not text:
-                scanned = _scan_document(img)
-                text = str(scanned.get("document_text") or scanned.get("ocr_text") or "").strip()
-                if text:
-                    # Bind text to image for next time.
-                    side = _sidecar_json_path(img)
-                    payload = {}
-                    if side.exists():
-                        try:
-                            payload = json.loads(side.read_text(encoding="utf-8"))
-                            if not isinstance(payload, dict):
-                                payload = {}
-                        except Exception:
-                            payload = {}
-                    payload["ocr_text"] = text
-                    payload["document_text"] = text
-                    payload.setdefault("filename", img.name)
-                    side.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            if text:
-                idx += 1
-                blocks.append(f"--- {label} {idx} ({img.name}) ---\n{text}")
+            out.append(img)
+            if len(out) >= limit:
+                return
 
-    add_dir("Еталон", examples_dir)
-    add_dir("Портфоліо", verifier_dir)
-    return blocks
+    add_dir(examples_dir)
+    if len(out) < limit:
+        add_dir(verifier_dir)
+    return out[:limit]
+
+
+def _cache_lookup_from_image(path: Path) -> Optional[dict]:
+    """Optional light OCR used ONLY as a content-hash cache key — never for scoring."""
+    # Prefer previously bound normalized_content / ocr_text if present.
+    bound = _read_bound_ocr_text(path)
+    if bound:
+        hit = text_cache.lookup(bound)
+        if hit:
+            return hit
+    try:
+        rough = ocr_engine.ocr_image(path)
+    except Exception:
+        return None
+    if not rough or len(rough.strip()) < 40:
+        return None
+    return text_cache.lookup(rough)
 
 
 def run_name_recognition(target_photo_path) -> dict:
-    """Pi Pass 1: Claude scans photo → name JSON → match student in DB."""
-    scanned = _scan_document(Path(target_photo_path))
+    """Pi Pass 1: Claude scans photo for NAME only → match student in DB."""
+    scanned = _scan_name(Path(target_photo_path))
     if scanned.get("error") and not scanned.get("found"):
         return _empty_name_result(str(scanned.get("error")))
 
-    ocr_text = str(scanned.get("document_text") or scanned.get("ocr_text") or "").strip()
-    matched = _match_student_in_ocr_text(
-        " ".join(
-            [
-                str(scanned.get("full_name") or ""),
-                str(scanned.get("display_name") or ""),
-                str(scanned.get("first_name") or ""),
-                str(scanned.get("last_name") or ""),
-                str(scanned.get("first_name_en") or ""),
-                str(scanned.get("last_name_en") or ""),
-                ocr_text,
-            ]
-        )
+    name_blob = " ".join(
+        [
+            str(scanned.get("full_name") or ""),
+            str(scanned.get("display_name") or ""),
+            str(scanned.get("first_name") or ""),
+            str(scanned.get("last_name") or ""),
+            str(scanned.get("first_name_en") or ""),
+            str(scanned.get("last_name_en") or ""),
+        ]
     )
+    matched = _match_student_in_ocr_text(name_blob)
     if matched:
-        out = _recognized_from_student(matched, ocr_text=ocr_text)
-        out["document_text"] = ocr_text
+        out = _recognized_from_student(matched, ocr_text="")
+        out["document_text"] = ""
         return out
 
     if not scanned.get("found"):
-        result = _empty_name_result()
-        result["ocr_text"] = ocr_text
-        result["document_text"] = ocr_text
-        return result
+        return _empty_name_result()
 
     first_en = str(scanned.get("first_name_en") or "").strip()
     last_en = str(scanned.get("last_name_en") or "").strip()
@@ -839,8 +807,8 @@ def run_name_recognition(target_photo_path) -> dict:
         "first_name_en": first_en,
         "last_name_en": last_en,
         "display_name": display,
-        "ocr_text": ocr_text,
-        "document_text": ocr_text,
+        "ocr_text": "",
+        "document_text": "",
         "matched_from_db": False,
     }
 
@@ -851,90 +819,95 @@ def run_ai_analysis(
     student: Optional[dict] = None,
     preferred_text: Optional[str] = None,
 ):
-    """Pass 2: bound OCR text + etalons → Claude Sonnet (web_search) → short UI verdict.
-
-    Prefer Pass-1 extracted text when provided; otherwise OCR the saved photo.
-    Does not rely on Qwen for the primary check.
-    """
+    """Pass 2: send homework IMAGE + etalon images to Claude (not OCR text)."""
     target = Path(target_photo_path)
-    work_text = (preferred_text or "").strip()
-    if not work_text:
-        work_text = _read_bound_ocr_text(target)
-    if not work_text:
-        scanned = _scan_document(target)
-        work_text = str(scanned.get("document_text") or scanned.get("ocr_text") or "").strip()
-        if scanned.get("error") and not work_text:
-            return {
-                "ai_percent": 0,
-                "description": f"Помилка OCR фото: {scanned.get('error')}",
-                "ocr_text": "",
-            }
-    if not work_text:
+    if not target.exists():
+        return {"ai_percent": 0, "description": "Фото не знайдено", "ocr_text": ""}
+
+    # 1) Content-hash cache (exact same text already scored) — OCR only as key, not as signal.
+    cached = None
+    if preferred_text:
+        cached = text_cache.lookup(preferred_text)
+    if not cached:
+        cached = _cache_lookup_from_image(target)
+    if cached:
+        desc = _short_verdict(str(cached.get("description", "")))
+        _write_image_binding(
+            target,
+            {
+                "ai_percent": int(cached["ai_percent"]),
+                "description": desc,
+                "pass": 2,
+                "cached_text": True,
+                "bound_at": time.time(),
+            },
+        )
         return {
-            "ai_percent": 0,
-            "description": "OCR не знайшов текст на фото роботи",
-            "ocr_text": "",
+            "ai_percent": int(cached["ai_percent"]),
+            "description": desc,
+            "ocr_text": preferred_text or _read_bound_ocr_text(target) or "",
+            "cached": True,
         }
 
-    # Keep text bound to this image for portfolio / re-analyze.
-    _write_image_binding(
-        target,
-        {
-            "document_text": work_text,
-            "ocr_text": work_text,
-            "pass": 2,
-            "bound_at": time.time(),
-        },
-    )
-
-    portfolio_blocks = []
+    etalon_imgs: list[Path] = []
     if student:
-        portfolio_blocks = _portfolio_texts(student, exclude_path=target)
-    else:
-        if examples_dir and Path(examples_dir).exists():
-            for idx, name in enumerate(
-                sorted(
-                    n
-                    for n in os.listdir(examples_dir)
-                    if n.lower().endswith((".png", ".jpg", ".jpeg"))
-                ),
-                start=1,
-            ):
-                img = Path(examples_dir) / name
-                text = _read_bound_ocr_text(img) or str(_scan_document(img).get("document_text") or "")
-                if text.strip():
-                    portfolio_blocks.append(f"--- Еталон {idx} ({name}) ---\n{text.strip()}")
+        etalon_imgs = _portfolio_images(student, exclude_path=target, limit=4)
+    elif examples_dir and Path(examples_dir).exists():
+        for name in sorted(os.listdir(examples_dir)):
+            if name.lower().endswith((".png", ".jpg", ".jpeg")):
+                etalon_imgs.append(Path(examples_dir) / name)
+            if len(etalon_imgs) >= 4:
+                break
 
     print(
-        f"[PASS2] Claude detect chars={len(work_text)} etalons={len(portfolio_blocks)} "
-        f"web_search=1",
+        f"[PASS2] Claude VISION detect image={target.name} etalon_imgs={len(etalon_imgs)}",
         flush=True,
     )
     if not claude_detect.available():
         return {
             "ai_percent": 0,
             "description": _short_verdict("Claude недоступний"),
-            "ocr_text": work_text,
+            "ocr_text": "",
         }
 
     try:
-        result = claude_detect.detect_deep(
-            work_text,
-            portfolio_blocks=portfolio_blocks,
+        result = claude_detect.detect_image(
+            target,
+            etalon_images=etalon_imgs,
             system_prompt=load_prompt(),
             use_web_search=True,
+            timeout=52.0,
+        )
+        pct = int(result.get("ai_percent", 0) or 0)
+        desc = _short_verdict(str(result.get("description", "")))
+        norm = str(result.get("normalized_content") or "").strip()
+        if norm:
+            text_cache.store(norm, pct, desc)
+        _write_image_binding(
+            target,
+            {
+                "ai_percent": pct,
+                "description": desc,
+                "normalized_content": norm,
+                "ocr_text": norm,
+                "document_text": norm,
+                "pass": 2,
+                "detector": "claude-vision+web_search",
+                "bound_at": time.time(),
+            },
         )
         return {
-            "ai_percent": int(result.get("ai_percent", 0) or 0),
-            "description": _short_verdict(str(result.get("description", ""))),
-            "ocr_text": work_text,
+            "ai_percent": pct,
+            "description": desc,
+            "ocr_text": norm,
+            "cached": False,
         }
     except Exception as exc:
-        print(f"[PASS2] Claude deep failed: {exc}", flush=True)
+        print(f"[PASS2] Claude vision failed: {exc}", flush=True)
         return {
             "ai_percent": 0,
             "description": _short_verdict(f"Помилка Claude: {exc}"),
-            "ocr_text": work_text,
+            "ocr_text": "",
         }
 
 
@@ -1054,9 +1027,9 @@ def _display_name_latin(recognized: dict, student) -> str:
 
 @app.post("/api/pi/recognize_student")
 async def recognize_student(file: UploadFile = File(...)):
-    """Pi Pass 1: OCR photo → separate name + document_text → bind to image → LCD name.
+    """Pi Pass 1: name-only vision scan → match student → LCD name.
 
-    Does NOT run AI %. Pass 2 (/upload/) uses the bound text + etalons with Claude.
+    Does NOT OCR homework body and does NOT run AI %. Pass 2 analyzes the IMAGE.
     """
     global last_pi_sync
     last_pi_sync = time.time()
@@ -1101,7 +1074,7 @@ async def recognize_student(file: UploadFile = File(...)):
     if not student:
         return {"status": "not_found", "message": "student not in database", "recognized": recognized}
 
-    # Bind Pass-1 photo + separated name/text for Pass-2 Claude check.
+    # Bind Pass-1 photo + name only (homework body is NOT OCR'd here).
     _save_pass1_binding(int(student["id"]), contents, recognized)
     db.set_active_student_id(student["id"])
     return {
@@ -1110,9 +1083,6 @@ async def recognize_student(file: UploadFile = File(...)):
         "student_name": full_name(student),
         "display_name": _display_name_latin(recognized, student),
         "recognized": recognized,
-        "document_text_chars": len(
-            str(recognized.get("document_text") or recognized.get("ocr_text") or "")
-        ),
         "pass": 1,
     }
 
@@ -1123,9 +1093,9 @@ async def upload_image(
     file: UploadFile = File(...),
     student_id: Optional[int] = Form(None),
 ):
-    """Pi Pass 2 (second button): bound Pass-1 text + etalons → Claude Sonnet web_search.
+    """Pi Pass 2 (second button): homework IMAGE + etalon images → Claude vision + web_search.
 
-    Saves the Pass-2 photo, reuses Pass-1 extracted text when available, returns a short phrase.
+    Compatible with existing Pi client (/upload/ + student_id). Returns a short phrase.
     """
     if student_id is None and request.query_params.get("student_id"):
         try:
@@ -1173,17 +1143,10 @@ async def upload_image(
     save_path = verifier_dir / filename
     save_path.write_bytes(contents)
 
-    # Prefer Pass-1 bound document_text (name was stored separately).
     pending = _load_pass1_binding(bound_id)
-    preferred_text = str(pending.get("document_text") or pending.get("ocr_text") or "").strip()
     pending_name = pending.get("name") if isinstance(pending.get("name"), dict) else {}
 
-    ai_result = run_ai_analysis(
-        save_path,
-        examples_dir,
-        student=student,
-        preferred_text=preferred_text or None,
-    )
+    ai_result = run_ai_analysis(save_path, examples_dir, student=student)
     ai_percent = int(ai_result.get("ai_percent", 0))
     description = str(ai_result.get("description", ""))
     ocr_text = str(ai_result.get("ocr_text", "") or "")
@@ -1200,8 +1163,8 @@ async def upload_image(
         "ocr_text": ocr_text,
         "document_text": ocr_text,
         "name": pending_name,
-        "from_pass1_text": bool(preferred_text),
-        "detector": "claude-sonnet-5-5+web_search",
+        "cached": bool(ai_result.get("cached")),
+        "detector": "claude-sonnet-5-5-vision+web_search",
         "timestamp": timestamp,
     }
     _write_image_binding(save_path, verdict_payload)
@@ -1216,9 +1179,8 @@ async def upload_image(
         "ai_percent": ai_percent,
         "description": description,
         "ocr_text": ocr_text,
-        "cached": False,
+        "cached": bool(ai_result.get("cached")),
         "pass": 2,
-        "from_pass1_text": bool(preferred_text),
     }
 
 
