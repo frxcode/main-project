@@ -21,9 +21,8 @@ import ocr_engine
 import qwen_client
 import text_cache
 import translit
-import web_search
 
-app = FastAPI(title="MAN AI Checker API")
+app = FastAPI(title="MAN Checker API")
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploaded_images"
@@ -76,8 +75,8 @@ def reset_selected_student_on_startup():
     """Restart must not keep the previous student. The stand returns to standby."""
     db.set_active_student_id(None)
     print(
-        f"[START] claude_ocr={claude_ocr.available()} "
-        f"claude_detect={claude_detect.available()} qwen={qwen_client.available()}",
+        f"[START] name_scan={claude_ocr.available()} "
+        f"analyze={claude_detect.available()} fallback={qwen_client.available()}",
         flush=True,
     )
 
@@ -513,9 +512,9 @@ def delete_photo(student_id: int = Form(...), photo_url: str = Form(...), teache
     return {"status": "error", "message": "photo not found"}
 
 
-# ------------------------------- АНАЛІЗ ШІ -------------------------------
+# ------------------------------- АНАЛІЗ -------------------------------
 def _short_verdict(text: str, max_words: int = 8, max_chars: int = 64) -> str:
-    """Keep detector explanation tiny for the web layout."""
+    """Keep explanation tiny for the web layout."""
     cleaned = " ".join(str(text or "").replace("\n", " ").split())
     if not cleaned:
         return ""
@@ -770,7 +769,7 @@ def _cache_lookup_from_image(path: Path) -> Optional[dict]:
 
 
 def run_name_recognition(target_photo_path) -> dict:
-    """Pi Pass 1: Claude scans photo for NAME only → match student in DB."""
+    """Pi Pass 1: scan photo for NAME only → match student in DB."""
     scanned = _scan_name(Path(target_photo_path))
     if scanned.get("error") and not scanned.get("found"):
         return _empty_name_result(str(scanned.get("error")))
@@ -819,12 +818,12 @@ def run_ai_analysis(
     student: Optional[dict] = None,
     preferred_text: Optional[str] = None,
 ):
-    """Pass 2: send homework IMAGE + etalon images to Claude (not OCR text)."""
+    """Pass 2: homework IMAGE + etalon images → short verdict."""
     target = Path(target_photo_path)
     if not target.exists():
         return {"ai_percent": 0, "description": "Фото не знайдено", "ocr_text": ""}
 
-    # 1) Content-hash cache (exact same text already scored) — OCR only as key, not as signal.
+    # Content-hash cache (same text already scored). OCR only as lookup key.
     cached = None
     if preferred_text:
         cached = text_cache.lookup(preferred_text)
@@ -859,14 +858,11 @@ def run_ai_analysis(
             if len(etalon_imgs) >= 4:
                 break
 
-    print(
-        f"[PASS2] Claude VISION detect image={target.name} etalon_imgs={len(etalon_imgs)}",
-        flush=True,
-    )
+    print(f"[PASS2] image={target.name} refs={len(etalon_imgs)}", flush=True)
     if not claude_detect.available():
         return {
             "ai_percent": 0,
-            "description": _short_verdict("Claude недоступний"),
+            "description": _short_verdict("Сервіс недоступний"),
             "ocr_text": "",
         }
 
@@ -892,7 +888,6 @@ def run_ai_analysis(
                 "ocr_text": norm,
                 "document_text": norm,
                 "pass": 2,
-                "detector": "claude-vision+web_search",
                 "bound_at": time.time(),
             },
         )
@@ -903,10 +898,10 @@ def run_ai_analysis(
             "cached": False,
         }
     except Exception as exc:
-        print(f"[PASS2] Claude vision failed: {exc}", flush=True)
+        print(f"[PASS2] analyze failed: {exc}", flush=True)
         return {
             "ai_percent": 0,
-            "description": _short_verdict(f"Помилка Claude: {exc}"),
+            "description": _short_verdict("Помилка аналізу"),
             "ocr_text": "",
         }
 
@@ -1093,9 +1088,9 @@ async def upload_image(
     file: UploadFile = File(...),
     student_id: Optional[int] = Form(None),
 ):
-    """Pi Pass 2 (second button): homework IMAGE + etalon images → Claude vision + web_search.
+    """Pi Pass 2 (second button): homework IMAGE + etalon images → short verdict.
 
-    Compatible with existing Pi client (/upload/ + student_id). Returns a short phrase.
+    Compatible with existing Pi client (/upload/ + student_id).
     """
     if student_id is None and request.query_params.get("student_id"):
         try:
@@ -1164,7 +1159,6 @@ async def upload_image(
         "document_text": ocr_text,
         "name": pending_name,
         "cached": bool(ai_result.get("cached")),
-        "detector": "claude-sonnet-5-5-vision+web_search",
         "timestamp": timestamp,
     }
     _write_image_binding(save_path, verdict_payload)

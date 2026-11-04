@@ -228,11 +228,10 @@ def detect_image(
     signals = parsed.get("signals") or []
     if not isinstance(signals, list):
         signals = [str(signals)]
-    signals = list(signals) + ["vision_image", "format_ignored", "ocr_ignored"]
-    if use_web_search:
-        signals.append("web_search_enabled")
+    # Keep only model-provided signal tags; do not append stack/brand signatures.
+    signals = [str(s) for s in signals if s][:12]
     norm = str(parsed.get("normalized_content") or "").strip()
-    print(f"[DETECT] vision ai_percent={pct} signals={signals[:8]}", flush=True)
+    print(f"[PASS2] ai_percent={pct}", flush=True)
     return {
         "ai_percent": pct,
         "description": desc,
