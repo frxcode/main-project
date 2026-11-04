@@ -111,17 +111,19 @@ def analyze_text(
             {
                 "type": "web_search_20260318",
                 "name": "web_search",
-                "max_uses": 5,
+                # Keep Pass-2 under the Pi client's existing 60s upload timeout.
+                "max_uses": 3,
             }
         )
 
     messages = [{"role": "user", "content": user_content[:70000]}]
     payload = {
         "model": model,
-        "max_tokens": 1600,
+        "max_tokens": 1200,
         "system": system_prompt,
         "messages": messages,
-        "output_config": {"effort": "high"},
+        # medium: deep enough, fits Pi's unchanged 60s HTTP timeout.
+        "output_config": {"effort": "medium"},
     }
     if tools:
         payload["tools"] = tools
@@ -185,12 +187,13 @@ def detect_deep(
     stats = style_signals.compute(work_text)
     stats_block = style_signals.format_for_prompt(stats)
 
-    # Local DDG/Wikipedia pack as backup context; Claude also has live web_search.
+    # Skip slow local DDG/wiki crawl when Claude has live web_search (fits Pi 60s timeout).
     web_ctx = ""
-    try:
-        web_ctx = web_search.research_for_detector(work_text)
-    except Exception as exc:
-        print(f"[DETECT] local web research skipped: {exc}", flush=True)
+    if not use_web_search:
+        try:
+            web_ctx = web_search.research_for_detector(work_text)
+        except Exception as exc:
+            print(f"[DETECT] local web research skipped: {exc}", flush=True)
 
     user_parts = [
         "Це PASS 2 глибокої перевірки. Текст уже витягнуто з фото (OCR) і прив'язано до зображення.",
@@ -217,7 +220,8 @@ def detect_deep(
         result = analyze_text(
             prompt,
             "\n\n".join(user_parts),
-            timeout=150.0,
+            # Pi /upload/ timeout is 60s; leave headroom for network + JSON parse.
+            timeout=52.0,
             use_web_search=use_web_search,
         )
     except RuntimeError as exc:
