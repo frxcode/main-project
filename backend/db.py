@@ -159,7 +159,6 @@ def clear_students_and_works():
     print("[DB] cleared all students and works", flush=True)
 
 
-# ------------------------------- міграція -------------------------------
 def _migrate_legacy_auth():
     """Переносить вчителів/сесії зі старої auth.db (одноразово)."""
     if not LEGACY_AUTH_DB.exists() or get_setting("legacy_auth_imported"):
@@ -240,7 +239,6 @@ def _migrate_legacy_students():
     print(f"[DB] imported {len(students)} legacy students", flush=True)
 
 
-# ------------------------------- settings -------------------------------
 def get_setting(key: str) -> Optional[str]:
     with connect() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -269,7 +267,6 @@ def set_active_student_id(student_id: Optional[int]):
     set_setting("active_student_id", str(student_id) if student_id is not None else None)
 
 
-# ------------------------------- teachers -------------------------------
 def get_teacher_by_email(email: str):
     with connect() as conn:
         row = conn.execute("SELECT * FROM teachers WHERE email = ?", (email,)).fetchone()
@@ -299,7 +296,6 @@ def claim_orphan_students(teacher_id: int) -> int:
         return cur.rowcount
 
 
-# ------------------------------- sessions -------------------------------
 def create_session(token: str, teacher_id: int):
     with connect() as conn:
         conn.execute(
@@ -326,7 +322,6 @@ def delete_session(token: str):
         conn.commit()
 
 
-# ------------------------------- students -------------------------------
 def _row_to_student(row, works=None) -> dict:
     return {
         "id": row["id"],

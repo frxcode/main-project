@@ -81,7 +81,6 @@ def reset_selected_student_on_startup():
     )
 
 
-# ------------------------------- АВТОРИЗАЦІЯ -------------------------------
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000)
@@ -190,7 +189,6 @@ def auth_me(teacher=Depends(require_teacher)):
     return {"status": "success", "email": teacher["email"]}
 
 
-# ------------------------------- ПРОМПТ -------------------------------
 def load_prompt():
     global AI_SYSTEM_PROMPT
     if PROMPT_FILE.exists():
@@ -216,7 +214,6 @@ def save_prompt(new_prompt: str):
     return AI_SYSTEM_PROMPT
 
 
-# ------------------------------- ДОПОМІЖНЕ -------------------------------
 def student_dirs(student):
     base = UPLOAD_DIR / student["folder_name"]
     verifier_dir = base / "verifier"
@@ -244,7 +241,6 @@ def read_root():
     return {"status": "ok", "message": "Static frontend not found"}
 
 
-# ------------------------------- УЧНІ (тільки свої) -------------------------------
 @app.get("/api/students")
 def get_students(teacher=Depends(require_teacher)):
     students = db.list_students_for_teacher(teacher["id"])
@@ -512,7 +508,6 @@ def delete_photo(student_id: int = Form(...), photo_url: str = Form(...), teache
     return {"status": "error", "message": "photo not found"}
 
 
-# ------------------------------- АНАЛІЗ -------------------------------
 def _short_verdict(text: str, max_words: int = 8, max_chars: int = 64) -> str:
     """Keep explanation tiny for the web layout."""
     cleaned = " ".join(str(text or "").replace("\n", " ").split())
@@ -952,7 +947,6 @@ def analyze_single_photo(student_id: int = Form(...), photo_url: str = Form(...)
     return {"status": "success", "result": result}
 
 
-# ------------------------------- ПРОМПТ (API) -------------------------------
 @app.get("/api/prompt")
 def get_current_prompt(teacher=Depends(require_teacher)):
     return {"status": "success", "prompt": load_prompt()}
@@ -976,7 +970,6 @@ async def set_current_prompt(request: Request, teacher=Depends(require_teacher))
     return {"status": "success", "prompt": save_prompt(prompt_text)}
 
 
-# ------------------------------- RASPBERRY PI (без авторизації) -------------------------------
 @app.get("/api/pi/sync")
 def pi_sync():
     global last_pi_sync
