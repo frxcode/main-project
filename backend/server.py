@@ -13,10 +13,10 @@ from typing import Optional
 from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from google import genai
-from google.genai import types
 
 import db
+import ocr_engine
+import qwen_client
 import translit
 
 app = FastAPI(title="MAN AI Checker API")
@@ -79,6 +79,8 @@ last_pi_sync = 0.0
 def reset_selected_student_on_startup():
     """Restart must not keep the previous student. The stand returns to standby."""
     db.set_active_student_id(None)
+    # Preload Indra OCR weights (CPU, INDRA_OCR_THREADS cores).
+    ocr_engine.warmup()
 
 
 # ------------------------------- АВТОРИЗАЦІЯ -------------------------------
@@ -276,22 +278,29 @@ def ensure_latin_name(first_name: str, last_name: str) -> tuple[str, str, bool]:
 
 
 def ai_transliterate_name(first_name: str, last_name: str):
-    """Ask the model for a Latin spelling. None when AI is unavailable."""
+    """Ask Qwen for a Latin spelling. None when API is unavailable."""
+    if not qwen_client.available():
+        return None
     try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            return None
-        ai_client = genai.Client(api_key=api_key)
-        response = ai_client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=[
-                "Transliterate this personal name from Cyrillic into Latin ASCII letters. "
-                "Use a common English spelling. Return ONLY JSON: "
-                '{"first_name_en":"Ivan","last_name_en":"Petrenko"}. No markdown.',
-                f"first_name: {first_name}\nlast_name: {last_name}",
+        text = qwen_client.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Transliterate this personal name from Cyrillic into Latin ASCII letters. "
+                        "Use a common English spelling. Return ONLY JSON: "
+                        '{"first_name_en":"Ivan","last_name_en":"Petrenko"}. No markdown.'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"first_name: {first_name}\nlast_name: {last_name}",
+                },
             ],
+            temperature=0.0,
+            timeout=30.0,
         )
-        payload = _parse_json_response(response.text or "")
+        payload = _parse_json_response(text)
         first_en = db.normalize_name_part(payload.get("first_name_en", ""))
         last_en = db.normalize_name_part(payload.get("last_name_en", ""))
         if translit.is_latin_name(first_en) and translit.is_latin_name(last_en):
@@ -506,13 +515,13 @@ def delete_photo(student_id: int = Form(...), photo_url: str = Form(...), teache
 
 
 # ------------------------------- АНАЛІЗ ШІ -------------------------------
-NAME_RECOGNITION_PROMPT = (
-    "Ти розпізнаєш рукописний або друкований текст на фото учнівської роботи. "
-    "Знайди прізвище та ім'я учня на листку (зазвичай зверху). "
+NAME_FROM_OCR_PROMPT = (
+    "Ти отримуєш OCR-текст учнівської роботи. "
+    "Знайди прізвище та ім'я учня (зазвичай на початку). "
     "Поверни кирилицю (якщо видно) і обов'язково латинський трансліт ASCII "
     "(English/Latin characters only у *_en і display_name — для LCD 16 символів). "
     "display_name: коротко 'Surname Name' латиницею. "
-    "Не вигадуй ім'я, якщо його немає на фото. "
+    "Не вигадуй ім'я, якщо його немає в тексті. "
     "Відповідь ТІЛЬКИ JSON без markdown: "
     '{"first_name":"Ім\'я","last_name":"Прізвище","full_name":"Ім\'я Прізвище",'
     '"first_name_en":"Name","last_name_en":"Surname","display_name":"Surname Name","found":true} '
@@ -520,6 +529,72 @@ NAME_RECOGNITION_PROMPT = (
     '{"first_name":"","last_name":"","full_name":"","first_name_en":"",'
     '"last_name_en":"","display_name":"","found":false}.'
 )
+
+
+def _empty_name_result(error: Optional[str] = None) -> dict:
+    payload = {
+        "found": False,
+        "first_name": "",
+        "last_name": "",
+        "full_name": "",
+        "first_name_en": "",
+        "last_name_en": "",
+        "display_name": "",
+        "ocr_text": "",
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _match_student_in_ocr_text(ocr_text: str) -> Optional[dict]:
+    """Pick a database student whose name appears in OCR text."""
+    text = (ocr_text or "").lower()
+    if not text.strip():
+        return None
+    best = None
+    best_score = 0
+    for student in db.list_all_students():
+        first = str(student.get("first_name") or "").strip()
+        last = str(student.get("last_name") or "").strip()
+        if not first or not last:
+            continue
+        latin_first, latin_last, _ = translit.latinize_parts(first, last)
+        variants = {
+            f"{first} {last}".lower(),
+            f"{last} {first}".lower(),
+            f"{latin_first} {latin_last}".lower(),
+            f"{latin_last} {latin_first}".lower(),
+            last.lower(),
+            latin_last.lower(),
+        }
+        score = 0
+        for variant in variants:
+            if variant and variant in text:
+                # Prefer full-name hits over surname-only.
+                score = max(score, 3 if " " in variant else 1)
+        if score > best_score:
+            best_score = score
+            best = student
+    return best if best_score > 0 else None
+
+
+def _recognized_from_student(student: dict, ocr_text: str = "") -> dict:
+    first = str(student.get("first_name") or "").strip()
+    last = str(student.get("last_name") or "").strip()
+    latin_first, latin_last, _ = translit.latinize_parts(first, last)
+    display = f"{latin_last} {latin_first}".strip()[:32]
+    return {
+        "found": True,
+        "first_name": first,
+        "last_name": last,
+        "full_name": f"{first} {last}".strip(),
+        "first_name_en": latin_first,
+        "last_name_en": latin_last,
+        "display_name": display,
+        "ocr_text": ocr_text,
+        "matched_from_db": True,
+    }
 
 
 def _parse_json_response(text_resp: str) -> dict:
@@ -543,20 +618,34 @@ def _parse_json_response(text_resp: str) -> dict:
 
 
 def run_name_recognition(target_photo_path) -> dict:
-    """Перший прохід ШІ: витягти ім'я/прізвище з фото роботи."""
+    """Pass 1: local Indra OCR → match name from DB (Qwen only if no DB hit)."""
     try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        ai_client = genai.Client(api_key=api_key) if api_key else genai.Client()
-        contents = [
-            NAME_RECOGNITION_PROMPT,
-            "Фото учнівської роботи:",
-            types.Part.from_bytes(data=Path(target_photo_path).read_bytes(), mime_type="image/png"),
-        ]
-        response = ai_client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=contents,
+        ocr_text = ocr_engine.ocr_image(target_photo_path)
+    except Exception as exc:
+        return _empty_name_result(str(exc))
+
+    matched = _match_student_in_ocr_text(ocr_text)
+    if matched:
+        return _recognized_from_student(matched, ocr_text=ocr_text)
+
+    if not ocr_text.strip():
+        return _empty_name_result()
+
+    if not qwen_client.available():
+        result = _empty_name_result("name not matched in database")
+        result["ocr_text"] = ocr_text
+        return result
+
+    try:
+        text_resp = qwen_client.chat(
+            [
+                {"role": "system", "content": NAME_FROM_OCR_PROMPT},
+                {"role": "user", "content": f"OCR-текст роботи:\n{ocr_text[:8000]}"},
+            ],
+            temperature=0.0,
+            timeout=45.0,
         )
-        payload = _parse_json_response(response.text or "")
+        payload = _parse_json_response(text_resp)
         first_en = str(payload.get("first_name_en", "") or "").strip()
         last_en = str(payload.get("last_name_en", "") or "").strip()
         display = str(payload.get("display_name", "") or "").strip()
@@ -570,21 +659,20 @@ def run_name_recognition(target_photo_path) -> dict:
             "first_name_en": first_en,
             "last_name_en": last_en,
             "display_name": display,
+            "ocr_text": ocr_text,
+            "matched_from_db": False,
         }
     except Exception as exc:
-        return {
-            "found": False,
-            "first_name": "",
-            "last_name": "",
-            "full_name": "",
-            "first_name_en": "",
-            "last_name_en": "",
-            "display_name": "",
-            "error": str(exc),
-        }
+        result = _empty_name_result(str(exc))
+        result["ocr_text"] = ocr_text
+        return result
 
 
 def run_ai_analysis(target_photo_path, examples_dir):
+    """Pass 2 / web analyze: OCR image → send TEXT to Groq (not the photo).
+
+    Photo stays on disk; OCR text is returned and saved next to it.
+    """
     example_photos = []
     if examples_dir.exists():
         example_photos = [
@@ -593,54 +681,66 @@ def run_ai_analysis(target_photo_path, examples_dir):
             if filename.lower().endswith((".png", ".jpg", ".jpeg"))
         ]
 
-    contents = [load_prompt()]
-    if example_photos:
-        contents.append("Еталонні роботи учня:")
-        for ex in example_photos:
-            try:
-                contents.append(types.Part.from_bytes(data=ex.read_bytes(), mime_type="image/png"))
-            except Exception:
-                continue
-    else:
-        contents.append("Увага: еталонних робіт немає, оцінюй за загальними критеріями.")
-
-    contents.append("Робота для перевірки:")
     try:
-        contents.append(types.Part.from_bytes(data=Path(target_photo_path).read_bytes(), mime_type="image/png"))
+        work_text = ocr_engine.ocr_image(target_photo_path)
     except Exception as exc:
-        return {"ai_percent": 0, "description": f"Помилка читання фото: {exc}"}
+        return {"ai_percent": 0, "description": f"Помилка OCR фото: {exc}", "ocr_text": ""}
 
-    try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        ai_client = genai.Client(api_key=api_key) if api_key else genai.Client()
-        response = ai_client.models.generate_content(model="gemini-3.5-flash-lite", contents=contents)
-        text_resp = (response.text or "").strip()
-        if not text_resp:
-            return {"ai_percent": 0, "description": "Gemini повернула порожню відповідь"}
+    if not work_text.strip():
+        return {
+            "ai_percent": 0,
+            "description": "OCR не знайшов текст на фото роботи",
+            "ocr_text": "",
+        }
 
-        text_resp = re.sub(r"^```(?:json)?\s*", "", text_resp, flags=re.IGNORECASE)
-        text_resp = re.sub(r"\s*```\s*$", "", text_resp, flags=re.IGNORECASE).strip()
-        start, end = text_resp.find("{"), text_resp.rfind("}")
-        if start >= 0 and end > start:
-            text_resp = text_resp[start : end + 1]
-
+    example_blocks = []
+    for idx, ex in enumerate(example_photos, start=1):
         try:
-            payload = json.loads(text_resp)
-        except json.JSONDecodeError:
-            try:
-                payload = ast.literal_eval(text_resp)
-            except (ValueError, SyntaxError):
-                try:
-                    payload = json.loads(text_resp.replace("'", '"'))
-                except Exception:
-                    payload = {"ai_percent": 0, "description": text_resp}
+            ex_text = ocr_engine.ocr_image(ex)
+        except Exception:
+            continue
+        if ex_text.strip():
+            example_blocks.append(f"--- Еталон {idx} ---\n{ex_text}")
 
-        if not isinstance(payload, dict):
-            payload = {"ai_percent": 0, "description": str(payload)}
+    user_parts = []
+    if example_blocks:
+        user_parts.append("Еталонні роботи учня (OCR-текст):")
+        user_parts.extend(example_blocks)
+    else:
+        user_parts.append("Увага: еталонних робіт немає, оцінюй за загальними критеріями.")
+    user_parts.append("Робота для перевірки (OCR-текст):")
+    user_parts.append(work_text)
 
-        return {"ai_percent": int(payload.get("ai_percent", 0)), "description": str(payload.get("description", ""))}
+    try:
+        text_resp = qwen_client.chat(
+            [
+                {"role": "system", "content": load_prompt()},
+                {"role": "user", "content": "\n\n".join(user_parts)[:24000]},
+            ],
+            temperature=0.2,
+            timeout=90.0,
+        )
+        if not text_resp:
+            return {
+                "ai_percent": 0,
+                "description": "Groq повернув порожню відповідь",
+                "ocr_text": work_text,
+            }
+
+        payload = _parse_json_response(text_resp)
+        if not payload:
+            payload = {"ai_percent": 0, "description": text_resp}
+        return {
+            "ai_percent": int(payload.get("ai_percent", 0) or 0),
+            "description": str(payload.get("description", "")),
+            "ocr_text": work_text,
+        }
     except Exception as exc:
-        return {"ai_percent": 0, "description": f"Помилка аналізу ШІ: {exc}"}
+        return {
+            "ai_percent": 0,
+            "description": f"Помилка аналізу ШІ: {exc}",
+            "ocr_text": work_text,
+        }
 
 
 @app.post("/api/photo/analyze")
@@ -729,7 +829,10 @@ def _display_name_latin(recognized: dict, student) -> str:
 
 @app.post("/api/pi/recognize_student")
 async def recognize_student(file: UploadFile = File(...)):
-    """Pass 1: AI name from photo → match existing student (never auto-create)."""
+    """Pi Pass 1 only: OCR photo → match student in DB → show name on LCD.
+
+    Does NOT run AI %. Pass 2 is /upload/ after the second button press.
+    """
     global last_pi_sync
     last_pi_sync = time.time()
 
@@ -789,7 +892,10 @@ async def upload_image(
     file: UploadFile = File(...),
     student_id: Optional[int] = Form(None),
 ):
-    """Pass 2: analysis permanently linked to student_id."""
+    """Pi Pass 2: save photo, OCR → text, send TEXT to Groq with prompt.
+
+    Image is stored on disk; OCR text is saved in the sidecar JSON next to it.
+    """
     if student_id is None and request.query_params.get("student_id"):
         try:
             student_id = int(request.query_params.get("student_id"))
@@ -813,12 +919,20 @@ async def upload_image(
     cached = db.find_work_by_hash(bound_id, file_hash)
     if cached:
         db.set_active_student_id(None)
+        cached_ocr = ""
+        sidecar = verifier_dir / f"{file_hash}.json"
+        if sidecar.exists():
+            try:
+                cached_ocr = str(json.loads(sidecar.read_text(encoding="utf-8")).get("ocr_text") or "")
+            except Exception:
+                cached_ocr = ""
         return {
             "status": "success",
             "student_id": bound_id,
             "student_name": full_name(student),
             "ai_percent": int(cached["ai_percent"]),
             "description": cached["description"],
+            "ocr_text": cached_ocr,
             "cached": True,
         }
 
@@ -829,8 +943,10 @@ async def upload_image(
     ai_result = run_ai_analysis(save_path, examples_dir)
     ai_percent = int(ai_result.get("ai_percent", 0))
     description = str(ai_result.get("description", ""))
+    ocr_text = str(ai_result.get("ocr_text", "") or "")
     timestamp = time.time()
 
+    # Image file + sibling JSON = photo bound to OCR text + verdict.
     verdict_payload = {
         "student_id": bound_id,
         "student_name": full_name(student),
@@ -838,6 +954,7 @@ async def upload_image(
         "file_hash": file_hash,
         "ai_percent": ai_percent,
         "description": description,
+        "ocr_text": ocr_text,
         "timestamp": timestamp,
     }
     (verifier_dir / f"{file_hash}.json").write_text(
@@ -853,6 +970,7 @@ async def upload_image(
         "student_name": full_name(student),
         "ai_percent": ai_percent,
         "description": description,
+        "ocr_text": ocr_text,
         "cached": False,
     }
 
