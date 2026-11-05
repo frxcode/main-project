@@ -89,14 +89,13 @@ body {
     letter-spacing: -0.02em;
 }
 
-.logo::before {
-    content: "";
+.brand-mark {
     width: 28px;
     height: 28px;
     border-radius: 9px;
-    background: linear-gradient(135deg, var(--brand) 0%, #8aa0ff 100%);
     box-shadow: var(--shadow-sm);
     flex: none;
+    display: block;
 }
 
 .top-bar-right {
@@ -905,13 +904,10 @@ button:active,
     margin-bottom: 22px;
 }
 
-.auth-brand::before {
-    content: "";
-    width: 26px;
-    height: 26px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, var(--brand) 0%, #8aa0ff 100%);
-    flex: none;
+.auth-brand .brand-mark {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
 }
 
 .auth-card h2 {

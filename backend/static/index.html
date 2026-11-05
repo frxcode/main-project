@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Перевірник на ШІ</title>
+    <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -11,10 +12,12 @@
 </head>
 <body>
 
-    <!-- ============================ АВТОРИЗАЦІЯ ВЧИТЕЛЯ ============================ -->
     <div class="auth-screen" id="auth-screen">
         <div class="auth-card">
-            <div class="auth-brand">Перевірник на ШІ</div>
+            <div class="auth-brand">
+                <img class="brand-mark" src="/static/logo.svg" alt="" width="36" height="36">
+                <span>Перевірник на ШІ</span>
+            </div>
             <h2 id="auth-title">Вхід для вчителя</h2>
             <p class="auth-sub" id="auth-subtitle">Увійдіть, щоб керувати перевіркою робіт учнів.</p>
 
@@ -41,10 +44,12 @@
         </div>
     </div>
 
-    <!-- ============================ ОСНОВНИЙ ДОДАТОК ============================ -->
     <div id="app" class="hidden">
         <header class="top-bar">
-            <div class="logo" onclick="loadMainView()" style="cursor: pointer;">Перевірник на ШІ</div>
+            <div class="logo" onclick="loadMainView()" style="cursor: pointer;">
+                <img class="brand-mark" src="/static/logo.svg" alt="" width="28" height="28">
+                <span>Перевірник на ШІ</span>
+            </div>
             <div class="top-bar-right">
                 <div class="user-chip">
                     <span class="user-email" id="header-user-email">—</span>
