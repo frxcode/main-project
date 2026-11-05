@@ -1,4 +1,4 @@
-"""Send auth emails via SMTP (Gmail app password recommended)."""
+"""Send auth emails via SMTP (Resend / Gmail app password / generic SMTP)."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from email.message import EmailMessage
 
 
 def _cfg():
-    host = (os.getenv("SMTP_HOST") or "smtp.gmail.com").strip()
-    port = int(os.getenv("SMTP_PORT") or "587")
+    host = (os.getenv("SMTP_HOST") or "smtp.resend.com").strip()
+    port = int(os.getenv("SMTP_PORT") or "465")
     user = (os.getenv("SMTP_USER") or os.getenv("SMTP_EMAIL") or "").strip()
     password = (os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_APP_PASSWORD") or "").strip()
     mail_from = (os.getenv("SMTP_FROM") or user).strip()
@@ -34,12 +34,17 @@ def send_email(to_email: str, subject: str, body: str) -> None:
     msg["To"] = to_email
     msg.set_content(body)
 
-    with smtplib.SMTP(host, port, timeout=25) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.ehlo()
-        smtp.login(user, password)
-        smtp.send_message(msg)
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, timeout=25) as smtp:
+            smtp.login(user, password)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=25) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(user, password)
+            smtp.send_message(msg)
     print(f"[MAIL] sent to={to_email} subject={subject!r}", flush=True)
 
 
