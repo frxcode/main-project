@@ -19,11 +19,22 @@ LEGACY_AUTH_DB = BASE_DIR / "auth.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS teachers (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    email         TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at    REAL NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    email          TEXT UNIQUE NOT NULL,
+    password_hash  TEXT NOT NULL,
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    auth_provider  TEXT NOT NULL DEFAULT 'password',
+    created_at     REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS auth_codes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    email      TEXT NOT NULL,
+    purpose    TEXT NOT NULL,
+    code_hash  TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_codes_email ON auth_codes(email, purpose);
 CREATE TABLE IF NOT EXISTS sessions (
     token      TEXT PRIMARY KEY,
     teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
@@ -79,9 +90,25 @@ def init_db():
     with connect() as conn:
         conn.executescript(SCHEMA)
         conn.commit()
+    _migrate_teacher_columns()
     _ensure_fullname_unique_index()
     _migrate_legacy_auth()
     _migrate_legacy_students()
+
+
+def _migrate_teacher_columns():
+    """Add newer teacher columns on existing databases."""
+    with connect() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(teachers)").fetchall()}
+        if "email_verified" not in cols:
+            conn.execute(
+                "ALTER TABLE teachers ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1"
+            )
+        if "auth_provider" not in cols:
+            conn.execute(
+                "ALTER TABLE teachers ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'password'"
+            )
+        conn.commit()
 
 
 def normalize_name_part(value: str) -> str:
@@ -273,14 +300,82 @@ def get_teacher_by_email(email: str):
     return dict(row) if row else None
 
 
-def create_teacher(email: str, password_hash: str) -> int:
+def create_teacher(
+    email: str,
+    password_hash: str,
+    *,
+    email_verified: bool = False,
+    auth_provider: str = "password",
+) -> int:
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO teachers (email, password_hash, created_at) VALUES (?, ?, ?)",
-            (email, password_hash, time.time()),
+            """INSERT INTO teachers
+               (email, password_hash, email_verified, auth_provider, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                email,
+                password_hash,
+                1 if email_verified else 0,
+                auth_provider or "password",
+                time.time(),
+            ),
         )
         conn.commit()
         return cur.lastrowid
+
+
+def set_teacher_verified(email: str, verified: bool = True):
+    with connect() as conn:
+        conn.execute(
+            "UPDATE teachers SET email_verified = ? WHERE email = ?",
+            (1 if verified else 0, email),
+        )
+        conn.commit()
+
+
+def set_teacher_password(email: str, password_hash: str):
+    with connect() as conn:
+        conn.execute(
+            "UPDATE teachers SET password_hash = ?, auth_provider = 'password' WHERE email = ?",
+            (password_hash, email),
+        )
+        conn.commit()
+
+
+def save_auth_code(email: str, purpose: str, code_hash: str, expires_at: float):
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM auth_codes WHERE email = ? AND purpose = ?",
+            (email, purpose),
+        )
+        conn.execute(
+            """INSERT INTO auth_codes (email, purpose, code_hash, expires_at, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (email, purpose, code_hash, float(expires_at), time.time()),
+        )
+        conn.commit()
+
+
+def consume_auth_code(email: str, purpose: str, code_hash: str) -> bool:
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT id, code_hash, expires_at FROM auth_codes
+               WHERE email = ? AND purpose = ?
+               ORDER BY id DESC LIMIT 1""",
+            (email, purpose),
+        ).fetchone()
+        if not row:
+            return False
+        if float(row["expires_at"]) < now:
+            conn.execute("DELETE FROM auth_codes WHERE email = ? AND purpose = ?", (email, purpose))
+            conn.commit()
+            return False
+        if row["code_hash"] != code_hash:
+            return False
+        conn.execute("DELETE FROM auth_codes WHERE email = ? AND purpose = ?", (email, purpose))
+        conn.commit()
+        return True
 
 
 def count_teachers() -> int:

@@ -17,11 +17,12 @@ from fastapi.staticfiles import StaticFiles
 import claude_detect
 import claude_ocr
 import db
+import email_sender
 import ocr_engine
 import qwen_client
 import translit
 
-app = FastAPI(title="MAN Checker API")
+app = FastAPI(title="АнтиГПТшник")
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploaded_images"
@@ -54,6 +55,8 @@ _load_env_file(BASE_DIR / ".env")
 SESSION_COOKIE = "session_token"
 SESSION_TTL = 60 * 60 * 24 * 30  # 30 днів
 GMAIL_RE = re.compile(r"^[^\s@]+@gmail\.com$", re.IGNORECASE)
+AUTH_CODE_TTL_S = 15 * 60
+GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
 
 DEFAULT_PROMPT = claude_detect.DEEP_SYSTEM_PROMPT
 
@@ -74,7 +77,8 @@ def reset_selected_student_on_startup():
     db.set_active_student_id(None)
     print(
         f"[START] name_scan={claude_ocr.available()} "
-        f"analyze={claude_detect.available()} fallback={qwen_client.available()}",
+        f"analyze={claude_detect.available()} fallback={qwen_client.available()} "
+        f"smtp={email_sender.available()} google={'yes' if GOOGLE_CLIENT_ID else 'no'}",
         flush=True,
     )
 
@@ -119,15 +123,18 @@ def set_session_cookie(response: Response, token: str):
     response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
 
 
-async def read_credentials(request: Request):
-    email = password = None
+async def read_json_body(request: Request) -> dict:
     try:
         body = await request.json()
-        if isinstance(body, dict):
-            email = body.get("email")
-            password = body.get("password")
+        return body if isinstance(body, dict) else {}
     except Exception:
-        pass
+        return {}
+
+
+async def read_credentials(request: Request):
+    body = await read_json_body(request)
+    email = body.get("email")
+    password = body.get("password")
     if email is None:
         try:
             form = await request.form()
@@ -138,27 +145,148 @@ async def read_credentials(request: Request):
     return (email or "").strip().lower(), (password or "")
 
 
+def _code_hash(email: str, purpose: str, code: str) -> str:
+    raw = f"{email}|{purpose}|{code}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _issue_auth_code(email: str, purpose: str) -> str:
+    code = f"{secrets.randbelow(100_000_000):08d}"
+    db.save_auth_code(
+        email,
+        purpose,
+        _code_hash(email, purpose, code),
+        time.time() + AUTH_CODE_TTL_S,
+    )
+    email_sender.send_auth_code(email, code, purpose)
+    return code
+
+
+def _login_teacher(response: Response, teacher: dict) -> dict:
+    token = secrets.token_urlsafe(32)
+    db.create_session(token, int(teacher["id"]))
+    set_session_cookie(response, token)
+    return {"status": "success", "email": teacher["email"]}
+
+
+@app.get("/api/auth/config")
+def auth_config():
+    return {
+        "status": "success",
+        "google_client_id": GOOGLE_CLIENT_ID,
+        "brand": "АнтиГПТшник",
+    }
+
+
 @app.post("/api/auth/register")
-async def auth_register(request: Request, response: Response):
+async def auth_register(request: Request):
     email, password = await read_credentials(request)
     if not GMAIL_RE.match(email):
         raise HTTPException(status_code=400, detail="Введіть коректну адресу Gmail")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Пароль має містити щонайменше 6 символів")
-    if db.get_teacher_by_email(email):
+    existing = db.get_teacher_by_email(email)
+    if existing and int(existing.get("email_verified") or 0) == 1:
         raise HTTPException(status_code=409, detail="Вчитель з такою поштою вже існує")
 
-    is_first_teacher = db.count_teachers() == 0
-    teacher_id = db.create_teacher(email, hash_password(password))
-    if is_first_teacher:
-        claimed = db.claim_orphan_students(teacher_id)
-        if claimed:
-            print(f"[AUTH] перший вчитель {email} отримав {claimed} учнів зі старої бази", flush=True)
+    if existing:
+        db.set_teacher_password(email, hash_password(password))
+        db.set_teacher_verified(email, False)
+        teacher_id = int(existing["id"])
+    else:
+        is_first_teacher = db.count_teachers() == 0
+        teacher_id = db.create_teacher(
+            email,
+            hash_password(password),
+            email_verified=False,
+            auth_provider="password",
+        )
+        if is_first_teacher:
+            claimed = db.claim_orphan_students(teacher_id)
+            if claimed:
+                print(f"[AUTH] перший вчитель {email} отримав {claimed} учнів", flush=True)
 
-    token = secrets.token_urlsafe(32)
-    db.create_session(token, teacher_id)
-    set_session_cookie(response, token)
-    return {"status": "success", "email": email}
+    _issue_auth_code(email, "verify")
+    return {
+        "status": "need_verification",
+        "email": email,
+        "message": "На пошту надіслано 8-значний код підтвердження",
+    }
+
+
+@app.post("/api/auth/verify")
+async def auth_verify(request: Request, response: Response):
+    body = await read_json_body(request)
+    email = str(body.get("email") or "").strip().lower()
+    code = str(body.get("code") or "").strip()
+    if not GMAIL_RE.match(email) or not re.fullmatch(r"\d{8}", code):
+        raise HTTPException(status_code=400, detail="Потрібні Gmail і код з 8 цифр")
+    if not db.consume_auth_code(email, "verify", _code_hash(email, "verify", code)):
+        raise HTTPException(status_code=400, detail="Невірний або прострочений код")
+    teacher = db.get_teacher_by_email(email)
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Акаунт не знайдено")
+    db.set_teacher_verified(email, True)
+    teacher = db.get_teacher_by_email(email)
+    return _login_teacher(response, teacher)
+
+
+@app.post("/api/auth/resend-code")
+async def auth_resend_code(request: Request):
+    body = await read_json_body(request)
+    email = str(body.get("email") or "").strip().lower()
+    purpose = str(body.get("purpose") or "verify").strip().lower()
+    if purpose not in {"verify", "reset"}:
+        raise HTTPException(status_code=400, detail="Невідома мета коду")
+    if not GMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Введіть коректну адресу Gmail")
+    teacher = db.get_teacher_by_email(email)
+    if not teacher:
+        # Don't leak account existence for reset.
+        if purpose == "reset":
+            return {"status": "ok", "message": "Якщо акаунт існує — код надіслано"}
+        raise HTTPException(status_code=404, detail="Акаунт не знайдено")
+    if purpose == "verify" and int(teacher.get("email_verified") or 0) == 1:
+        raise HTTPException(status_code=400, detail="Пошта вже підтверджена")
+    _issue_auth_code(email, purpose)
+    return {"status": "ok", "email": email, "message": "Код надіслано повторно"}
+
+
+@app.post("/api/auth/forgot")
+async def auth_forgot(request: Request):
+    body = await read_json_body(request)
+    email = str(body.get("email") or "").strip().lower()
+    if not GMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Введіть коректну адресу Gmail")
+    teacher = db.get_teacher_by_email(email)
+    if teacher:
+        _issue_auth_code(email, "reset")
+    return {
+        "status": "ok",
+        "email": email,
+        "message": "Якщо акаунт існує — на пошту надіслано 8-значний код",
+    }
+
+
+@app.post("/api/auth/reset")
+async def auth_reset(request: Request, response: Response):
+    body = await read_json_body(request)
+    email = str(body.get("email") or "").strip().lower()
+    code = str(body.get("code") or "").strip()
+    new_password = str(body.get("password") or body.get("new_password") or "")
+    if not GMAIL_RE.match(email) or not re.fullmatch(r"\d{8}", code):
+        raise HTTPException(status_code=400, detail="Потрібні Gmail і код з 8 цифр")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Пароль має містити щонайменше 6 символів")
+    if not db.consume_auth_code(email, "reset", _code_hash(email, "reset", code)):
+        raise HTTPException(status_code=400, detail="Невірний або прострочений код")
+    teacher = db.get_teacher_by_email(email)
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Акаунт не знайдено")
+    db.set_teacher_password(email, hash_password(new_password))
+    db.set_teacher_verified(email, True)
+    teacher = db.get_teacher_by_email(email)
+    return _login_teacher(response, teacher)
 
 
 @app.post("/api/auth/login")
@@ -167,11 +295,58 @@ async def auth_login(request: Request, response: Response):
     teacher = db.get_teacher_by_email(email)
     if not teacher or not verify_password(password, teacher["password_hash"]):
         raise HTTPException(status_code=401, detail="Невірна пошта або пароль")
+    if int(teacher.get("email_verified") or 0) != 1:
+        _issue_auth_code(email, "verify")
+        return {
+            "status": "need_verification",
+            "email": email,
+            "message": "Підтвердіть пошту кодом з листа",
+        }
+    return _login_teacher(response, teacher)
 
-    token = secrets.token_urlsafe(32)
-    db.create_session(token, teacher["id"])
-    set_session_cookie(response, token)
-    return {"status": "success", "email": teacher["email"]}
+
+@app.post("/api/auth/google")
+async def auth_google(request: Request, response: Response):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google Sign-In не налаштовано")
+    body = await read_json_body(request)
+    credential = str(body.get("credential") or body.get("id_token") or "").strip()
+    if not credential:
+        raise HTTPException(status_code=400, detail="Немає Google credential")
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+
+        info = google_id_token.verify_oauth2_token(
+            credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Невірний Google токен: {exc}") from exc
+
+    email = str(info.get("email") or "").strip().lower()
+    if not GMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Потрібен акаунт Gmail")
+    if not info.get("email_verified"):
+        raise HTTPException(status_code=400, detail="Google-пошта не підтверджена")
+
+    teacher = db.get_teacher_by_email(email)
+    if not teacher:
+        is_first = db.count_teachers() == 0
+        teacher_id = db.create_teacher(
+            email,
+            hash_password(secrets.token_urlsafe(24)),
+            email_verified=True,
+            auth_provider="google",
+        )
+        if is_first:
+            db.claim_orphan_students(teacher_id)
+        teacher = db.get_teacher_by_email(email)
+    else:
+        db.set_teacher_verified(email, True)
+        teacher = db.get_teacher_by_email(email)
+    return _login_teacher(response, teacher)
 
 
 @app.post("/api/auth/logout")

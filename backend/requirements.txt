@@ -2,5 +2,6 @@ fastapi==0.143.0
 uvicorn[standard]==0.54.0
 python-multipart==0.0.32
 google-genai==2.29.0
+google-auth==2.41.1
 indra-ocr
 

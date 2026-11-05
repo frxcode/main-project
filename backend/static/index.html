@@ -3,13 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Перевірник на ШІ</title>
+    <title>АнтиГПТшник</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
     <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=3">
+    <link rel="stylesheet" href="/static/style.css?v=4">
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 
@@ -17,31 +18,52 @@
         <div class="auth-card">
             <div class="auth-brand">
                 <span class="brand-mark" aria-hidden="true"></span>
-                <span>Перевірник на ШІ</span>
+                <span>АнтиГПТшник</span>
             </div>
             <h2 id="auth-title">Вхід для вчителя</h2>
             <p class="auth-sub" id="auth-subtitle">Увійдіть, щоб керувати перевіркою робіт учнів.</p>
 
-            <div class="auth-tabs">
+            <div class="auth-tabs" id="auth-tabs">
                 <button type="button" id="tab-login" class="active" onclick="setAuthMode('login')">Увійти</button>
                 <button type="button" id="tab-signup" onclick="setAuthMode('signup')">Зареєструватися</button>
             </div>
 
             <div class="auth-error" id="auth-error"></div>
+            <div class="auth-ok" id="auth-ok"></div>
 
             <form id="auth-form" onsubmit="return handleAuthSubmit(event)">
                 <div class="field">
-                    <label for="auth-email">Електронна пошта (Gmail)</label>
+                    <label for="auth-email">Gmail</label>
                     <input type="email" id="auth-email" placeholder="teacher@gmail.com" autocomplete="email" required>
                 </div>
-                <div class="field">
+                <div class="field" id="auth-password-field">
                     <label for="auth-password">Пароль</label>
-                    <input type="password" id="auth-password" placeholder="••••••••" autocomplete="current-password" minlength="6" required>
+                    <input type="password" id="auth-password" placeholder="••••••••" autocomplete="current-password" minlength="6">
+                </div>
+                <div class="field hidden" id="auth-code-field">
+                    <label for="auth-code">Код з пошти (8 цифр)</label>
+                    <input type="text" id="auth-code" inputmode="numeric" pattern="\d{8}" maxlength="8" placeholder="12345678" autocomplete="one-time-code">
+                </div>
+                <div class="field hidden" id="auth-new-password-field">
+                    <label for="auth-new-password">Новий пароль</label>
+                    <input type="password" id="auth-new-password" placeholder="••••••••" minlength="6" autocomplete="new-password">
                 </div>
                 <button type="submit" class="btn-primary auth-submit" id="auth-submit-btn">Увійти</button>
             </form>
 
-            <p class="auth-foot">Дані зберігаються на сервері. Сесія входу зберігається у cookie.</p>
+            <div class="auth-links" id="auth-links">
+                <button type="button" class="linkish" id="forgot-link" onclick="setAuthMode('forgot')">Забув пароль</button>
+                <button type="button" class="linkish hidden" id="resend-link" onclick="resendAuthCode()">Надіслати код ще раз</button>
+                <button type="button" class="linkish hidden" id="back-login-link" onclick="setAuthMode('login')">Назад до входу</button>
+            </div>
+
+            <div class="auth-divider" id="google-divider"><span>або</span></div>
+            <div id="google-btn-wrap" class="google-btn-wrap">
+                <div id="google-signin-btn"></div>
+                <p class="auth-foot" id="google-hint">Увімкніть Google Sign-In у налаштуваннях сервера.</p>
+            </div>
+
+            <p class="auth-foot">Лише Gmail. Підтвердження — 8-значним кодом на пошту.</p>
         </div>
     </div>
 
@@ -49,7 +71,7 @@
         <header class="top-bar">
             <div class="logo" onclick="loadMainView()" style="cursor: pointer;">
                 <span class="brand-mark" aria-hidden="true"></span>
-                <span>Перевірник на ШІ</span>
+                <span>АнтиГПТшник</span>
             </div>
             <div class="top-bar-right">
                 <div class="user-chip">
@@ -205,9 +227,10 @@
         let selectedPhotoUrl = null;
         let lastLatestResultSignature = null;
 
-        /* ============================ АВТОРИЗАЦІЯ ВЧИТЕЛЯ (серверна БД) ============================ */
         let authMode = 'login';
         let currentTeacherEmail = null;
+        let pendingAuthEmail = null;
+        let googleClientId = '';
 
         function isAuthenticated() {
             return !!currentTeacherEmail;
@@ -217,24 +240,60 @@
             const box = document.getElementById('auth-error');
             box.textContent = message;
             box.classList.add('show');
+            document.getElementById('auth-ok').classList.remove('show');
+        }
+
+        function showAuthOk(message) {
+            const box = document.getElementById('auth-ok');
+            box.textContent = message;
+            box.classList.add('show');
+            document.getElementById('auth-error').classList.remove('show');
         }
 
         function clearAuthError() {
             document.getElementById('auth-error').classList.remove('show');
+            document.getElementById('auth-ok').classList.remove('show');
         }
 
         function setAuthMode(mode) {
             authMode = mode;
             clearAuthError();
             const isLogin = mode === 'login';
+            const isSignup = mode === 'signup';
+            const isVerify = mode === 'verify';
+            const isForgot = mode === 'forgot';
+            const isReset = mode === 'reset';
+
+            document.getElementById('auth-tabs').classList.toggle('hidden', isVerify || isForgot || isReset);
             document.getElementById('tab-login').classList.toggle('active', isLogin);
-            document.getElementById('tab-signup').classList.toggle('active', !isLogin);
-            document.getElementById('auth-title').textContent = isLogin ? 'Вхід для вчителя' : 'Реєстрація вчителя';
-            document.getElementById('auth-subtitle').textContent = isLogin
-                ? 'Увійдіть, щоб керувати перевіркою робіт учнів.'
-                : 'Створіть обліковий запис, щоб почати перевіряти роботи.';
-            document.getElementById('auth-submit-btn').textContent = isLogin ? 'Увійти' : 'Створити акаунт';
-            document.getElementById('auth-password').setAttribute('autocomplete', isLogin ? 'current-password' : 'new-password');
+            document.getElementById('tab-signup').classList.toggle('active', isSignup);
+
+            document.getElementById('auth-password-field').classList.toggle('hidden', isVerify || isForgot || isReset);
+            document.getElementById('auth-code-field').classList.toggle('hidden', !(isVerify || isReset));
+            document.getElementById('auth-new-password-field').classList.toggle('hidden', !isReset);
+            document.getElementById('resend-link').classList.toggle('hidden', !(isVerify || isReset));
+            document.getElementById('back-login-link').classList.toggle('hidden', isLogin || isSignup);
+            document.getElementById('forgot-link').classList.toggle('hidden', !isLogin);
+            document.getElementById('google-divider').classList.toggle('hidden', !(isLogin || isSignup));
+            document.getElementById('google-btn-wrap').classList.toggle('hidden', !(isLogin || isSignup));
+
+            const titles = {
+                login: ['Вхід для вчителя', 'Увійдіть через Gmail або Google.', 'Увійти'],
+                signup: ['Реєстрація', 'Створіть акаунт Gmail — надішлемо код підтвердження.', 'Створити акаунт'],
+                verify: ['Підтвердження пошти', 'Введіть 8-значний код з листа.', 'Підтвердити'],
+                forgot: ['Забули пароль?', 'Вкажіть Gmail — надішлемо код скидання.', 'Надіслати код'],
+                reset: ['Новий пароль', 'Введіть код з листа і новий пароль.', 'Зберегти пароль'],
+            };
+            const [title, sub, btn] = titles[mode] || titles.login;
+            document.getElementById('auth-title').textContent = title;
+            document.getElementById('auth-subtitle').textContent = sub;
+            document.getElementById('auth-submit-btn').textContent = btn;
+            document.getElementById('auth-password').required = isLogin || isSignup;
+            document.getElementById('auth-code').required = isVerify || isReset;
+            document.getElementById('auth-new-password').required = isReset;
+            if (pendingAuthEmail && (isVerify || isReset || isForgot)) {
+                document.getElementById('auth-email').value = pendingAuthEmail;
+            }
         }
 
         async function handleAuthSubmit(event) {
@@ -243,36 +302,147 @@
 
             const email = document.getElementById('auth-email').value.trim().toLowerCase();
             const password = document.getElementById('auth-password').value;
+            const code = document.getElementById('auth-code').value.trim();
+            const newPassword = document.getElementById('auth-new-password').value;
 
             if (!/^[^\s@]+@gmail\.com$/.test(email)) {
-                showAuthError('Введіть коректну адресу Gmail (наприклад, name@gmail.com).');
+                showAuthError('Введіть коректну адресу Gmail.');
                 return false;
             }
-            if (password.length < 6) {
+            if ((authMode === 'login' || authMode === 'signup') && password.length < 6) {
                 showAuthError('Пароль має містити щонайменше 6 символів.');
                 return false;
             }
+            if ((authMode === 'verify' || authMode === 'reset') && !/^\d{8}$/.test(code)) {
+                showAuthError('Код має містити рівно 8 цифр.');
+                return false;
+            }
+            if (authMode === 'reset' && newPassword.length < 6) {
+                showAuthError('Новий пароль має містити щонайменше 6 символів.');
+                return false;
+            }
 
-            const endpoint = authMode === 'signup' ? '/api/auth/register' : '/api/auth/login';
             const submitBtn = document.getElementById('auth-submit-btn');
             submitBtn.disabled = true;
 
             try {
-                const data = await fetchJson(endpoint, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    credentials: 'include',
-                    body: JSON.stringify({ email, password })
-                });
-                currentTeacherEmail = data.email || email;
-                document.getElementById('auth-form').reset();
-                enterApp();
+                if (authMode === 'login' || authMode === 'signup') {
+                    const endpoint = authMode === 'signup' ? '/api/auth/register' : '/api/auth/login';
+                    const data = await fetchJson(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include',
+                        body: JSON.stringify({ email, password })
+                    });
+                    if (data.status === 'need_verification') {
+                        pendingAuthEmail = data.email || email;
+                        setAuthMode('verify');
+                        showAuthOk(data.message || 'Код надіслано на пошту.');
+                        return false;
+                    }
+                    currentTeacherEmail = data.email || email;
+                    document.getElementById('auth-form').reset();
+                    enterApp();
+                } else if (authMode === 'verify') {
+                    const data = await fetchJson('/api/auth/verify', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include',
+                        body: JSON.stringify({ email, code })
+                    });
+                    currentTeacherEmail = data.email || email;
+                    pendingAuthEmail = null;
+                    document.getElementById('auth-form').reset();
+                    enterApp();
+                } else if (authMode === 'forgot') {
+                    const data = await fetchJson('/api/auth/forgot', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email })
+                    });
+                    pendingAuthEmail = email;
+                    setAuthMode('reset');
+                    showAuthOk(data.message || 'Якщо акаунт існує — код надіслано.');
+                } else if (authMode === 'reset') {
+                    const data = await fetchJson('/api/auth/reset', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include',
+                        body: JSON.stringify({ email, code, password: newPassword })
+                    });
+                    currentTeacherEmail = data.email || email;
+                    pendingAuthEmail = null;
+                    document.getElementById('auth-form').reset();
+                    enterApp();
+                }
             } catch (error) {
                 showAuthError(error.message || 'Не вдалося авторизуватися.');
             } finally {
                 submitBtn.disabled = false;
             }
             return false;
+        }
+
+        async function resendAuthCode() {
+            clearAuthError();
+            const email = (document.getElementById('auth-email').value.trim().toLowerCase() || pendingAuthEmail || '');
+            if (!/^[^\s@]+@gmail\.com$/.test(email)) {
+                showAuthError('Введіть коректну адресу Gmail.');
+                return;
+            }
+            const purpose = authMode === 'reset' ? 'reset' : 'verify';
+            try {
+                const data = await fetchJson('/api/auth/resend-code', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, purpose })
+                });
+                showAuthOk(data.message || 'Код надіслано повторно.');
+            } catch (error) {
+                showAuthError(error.message || 'Не вдалося надіслати код.');
+            }
+        }
+
+        async function handleGoogleCredential(response) {
+            clearAuthError();
+            try {
+                const data = await fetchJson('/api/auth/google', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ credential: response.credential })
+                });
+                currentTeacherEmail = data.email;
+                enterApp();
+            } catch (error) {
+                showAuthError(error.message || 'Google Sign-In не вдався.');
+            }
+        }
+
+        function renderGoogleButton() {
+            const hint = document.getElementById('google-hint');
+            const host = document.getElementById('google-signin-btn');
+            host.innerHTML = '';
+            if (!googleClientId || !window.google || !google.accounts || !google.accounts.id) {
+                hint.textContent = googleClientId
+                    ? 'Завантаження Google…'
+                    : 'Додайте GOOGLE_CLIENT_ID у .env для кнопки Google.';
+                hint.classList.remove('hidden');
+                return;
+            }
+            hint.classList.add('hidden');
+            google.accounts.id.initialize({
+                client_id: googleClientId,
+                callback: handleGoogleCredential,
+                ux_mode: 'popup',
+            });
+            google.accounts.id.renderButton(host, {
+                theme: 'outline',
+                size: 'large',
+                shape: 'pill',
+                text: 'continue_with',
+                width: 320,
+            });
         }
 
         function enterApp() {
@@ -297,6 +467,16 @@
         }
 
         async function initAuth() {
+            try {
+                const cfg = await fetchJson('/api/auth/config');
+                googleClientId = cfg.google_client_id || '';
+            } catch (error) {
+                googleClientId = '';
+            }
+            renderGoogleButton();
+            // Google script may load after us.
+            window.addEventListener('load', () => setTimeout(renderGoogleButton, 400));
+
             try {
                 const data = await fetchJson('/api/auth/me', { credentials: 'include' });
                 currentTeacherEmail = data.email;
