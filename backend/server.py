@@ -19,7 +19,6 @@ import claude_ocr
 import db
 import ocr_engine
 import qwen_client
-import text_cache
 import translit
 
 app = FastAPI(title="MAN Checker API")
@@ -62,7 +61,6 @@ AI_SYSTEM_PROMPT = DEFAULT_PROMPT
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 db.init_db()
-text_cache.init(UPLOAD_DIR)
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
@@ -746,23 +744,6 @@ def _portfolio_images(student: dict, exclude_path: Optional[Path] = None, limit:
     return out[:limit]
 
 
-def _cache_lookup_from_image(path: Path) -> Optional[dict]:
-    """Optional light OCR used ONLY as a content-hash cache key — never for scoring."""
-    # Prefer previously bound normalized_content / ocr_text if present.
-    bound = _read_bound_ocr_text(path)
-    if bound:
-        hit = text_cache.lookup(bound)
-        if hit:
-            return hit
-    try:
-        rough = ocr_engine.ocr_image(path)
-    except Exception:
-        return None
-    if not rough or len(rough.strip()) < 40:
-        return None
-    return text_cache.lookup(rough)
-
-
 def run_name_recognition(target_photo_path) -> dict:
     """Pi Pass 1: scan photo for NAME only → match student in DB."""
     scanned = _scan_name(Path(target_photo_path))
@@ -813,35 +794,11 @@ def run_ai_analysis(
     student: Optional[dict] = None,
     preferred_text: Optional[str] = None,
 ):
-    """Pass 2: homework IMAGE + etalon images → short verdict."""
+    """Pass 2: homework IMAGE + etalon images → short verdict (always fresh, no cache)."""
+    _ = preferred_text  # unused; kept for call-site compatibility
     target = Path(target_photo_path)
     if not target.exists():
         return {"ai_percent": 0, "description": "Фото не знайдено", "ocr_text": ""}
-
-    # Content-hash cache (same text already scored). OCR only as lookup key.
-    cached = None
-    if preferred_text:
-        cached = text_cache.lookup(preferred_text)
-    if not cached:
-        cached = _cache_lookup_from_image(target)
-    if cached:
-        desc = _short_verdict(str(cached.get("description", "")))
-        _write_image_binding(
-            target,
-            {
-                "ai_percent": int(cached["ai_percent"]),
-                "description": desc,
-                "pass": 2,
-                "cached_text": True,
-                "bound_at": time.time(),
-            },
-        )
-        return {
-            "ai_percent": int(cached["ai_percent"]),
-            "description": desc,
-            "ocr_text": preferred_text or _read_bound_ocr_text(target) or "",
-            "cached": True,
-        }
 
     etalon_imgs: list[Path] = []
     if student:
@@ -872,8 +829,6 @@ def run_ai_analysis(
         pct = int(result.get("ai_percent", 0) or 0)
         desc = _short_verdict(str(result.get("description", "")))
         norm = str(result.get("normalized_content") or "").strip()
-        if norm:
-            text_cache.store(norm, pct, desc)
         _write_image_binding(
             target,
             {
@@ -1105,28 +1060,6 @@ async def upload_image(
         return {"status": "error", "message": "empty file"}
 
     file_hash = hashlib.md5(contents).hexdigest()
-    cached = db.find_work_by_hash(bound_id, file_hash)
-    if cached:
-        db.set_active_student_id(None)
-        _clear_pass1_binding(bound_id)
-        cached_ocr = ""
-        sidecar = verifier_dir / f"{file_hash}.json"
-        if sidecar.exists():
-            try:
-                cached_ocr = str(json.loads(sidecar.read_text(encoding="utf-8")).get("ocr_text") or "")
-            except Exception:
-                cached_ocr = ""
-        return {
-            "status": "success",
-            "student_id": bound_id,
-            "student_name": full_name(student),
-            "ai_percent": int(cached["ai_percent"]),
-            "description": cached["description"],
-            "ocr_text": cached_ocr,
-            "cached": True,
-            "pass": 2,
-        }
-
     filename = f"{file_hash}.png"
     save_path = verifier_dir / filename
     save_path.write_bytes(contents)
