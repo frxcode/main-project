@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=4">
+    <link rel="stylesheet" href="/static/style.css?v=5">
     <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -33,8 +33,8 @@
 
             <form id="auth-form" onsubmit="return handleAuthSubmit(event)">
                 <div class="field">
-                    <label for="auth-email">Gmail</label>
-                    <input type="email" id="auth-email" placeholder="teacher@gmail.com" autocomplete="email" required>
+                    <label for="auth-email">Електронна пошта</label>
+                    <input type="email" id="auth-email" placeholder="teacher@school.edu" autocomplete="email" required>
                 </div>
                 <div class="field" id="auth-password-field">
                     <label for="auth-password">Пароль</label>
@@ -63,7 +63,7 @@
                 <p class="auth-foot" id="google-hint">Увімкніть Google Sign-In у налаштуваннях сервера.</p>
             </div>
 
-            <p class="auth-foot">Лише Gmail. Підтвердження — 8-значним кодом на пошту.</p>
+            <p class="auth-foot">Підтвердження — 8-значним кодом на вашу пошту.</p>
         </div>
     </div>
 
@@ -278,10 +278,10 @@
             document.getElementById('google-btn-wrap').classList.toggle('hidden', !(isLogin || isSignup));
 
             const titles = {
-                login: ['Вхід для вчителя', 'Увійдіть через Gmail або Google.', 'Увійти'],
-                signup: ['Реєстрація', 'Створіть акаунт Gmail — надішлемо код підтвердження.', 'Створити акаунт'],
+                login: ['Вхід для вчителя', 'Увійдіть через пошту або Google.', 'Увійти'],
+                signup: ['Реєстрація', 'Створіть акаунт — надішлемо код підтвердження на пошту.', 'Створити акаунт'],
                 verify: ['Підтвердження пошти', 'Введіть 8-значний код з листа.', 'Підтвердити'],
-                forgot: ['Забули пароль?', 'Вкажіть Gmail — надішлемо код скидання.', 'Надіслати код'],
+                forgot: ['Забули пароль?', 'Вкажіть пошту — надішлемо код скидання.', 'Надіслати код'],
                 reset: ['Новий пароль', 'Введіть код з листа і новий пароль.', 'Зберегти пароль'],
             };
             const [title, sub, btn] = titles[mode] || titles.login;
@@ -305,8 +305,8 @@
             const code = document.getElementById('auth-code').value.trim();
             const newPassword = document.getElementById('auth-new-password').value;
 
-            if (!/^[^\s@]+@gmail\.com$/.test(email)) {
-                showAuthError('Введіть коректну адресу Gmail.');
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                showAuthError('Введіть коректну адресу електронної пошти.');
                 return false;
             }
             if ((authMode === 'login' || authMode === 'signup') && password.length < 6) {
@@ -386,8 +386,8 @@
         async function resendAuthCode() {
             clearAuthError();
             const email = (document.getElementById('auth-email').value.trim().toLowerCase() || pendingAuthEmail || '');
-            if (!/^[^\s@]+@gmail\.com$/.test(email)) {
-                showAuthError('Введіть коректну адресу Gmail.');
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                showAuthError('Введіть коректну адресу електронної пошти.');
                 return;
             }
             const purpose = authMode === 'reset' ? 'reset' : 'verify';

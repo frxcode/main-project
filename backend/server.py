@@ -54,7 +54,7 @@ _load_env_file(BASE_DIR / ".env")
 
 SESSION_COOKIE = "session_token"
 SESSION_TTL = 60 * 60 * 24 * 30  # 30 днів
-GMAIL_RE = re.compile(r"^[^\s@]+@gmail\.com$", re.IGNORECASE)
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", re.IGNORECASE)
 AUTH_CODE_TTL_S = 15 * 60
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
 
@@ -181,8 +181,8 @@ def auth_config():
 @app.post("/api/auth/register")
 async def auth_register(request: Request):
     email, password = await read_credentials(request)
-    if not GMAIL_RE.match(email):
-        raise HTTPException(status_code=400, detail="Введіть коректну адресу Gmail")
+    if not EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Введіть коректну адресу електронної пошти")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Пароль має містити щонайменше 6 символів")
     existing = db.get_teacher_by_email(email)
@@ -219,8 +219,8 @@ async def auth_verify(request: Request, response: Response):
     body = await read_json_body(request)
     email = str(body.get("email") or "").strip().lower()
     code = str(body.get("code") or "").strip()
-    if not GMAIL_RE.match(email) or not re.fullmatch(r"\d{8}", code):
-        raise HTTPException(status_code=400, detail="Потрібні Gmail і код з 8 цифр")
+    if not EMAIL_RE.match(email) or not re.fullmatch(r"\d{8}", code):
+        raise HTTPException(status_code=400, detail="Потрібні пошта і код з 8 цифр")
     if not db.consume_auth_code(email, "verify", _code_hash(email, "verify", code)):
         raise HTTPException(status_code=400, detail="Невірний або прострочений код")
     teacher = db.get_teacher_by_email(email)
@@ -238,8 +238,8 @@ async def auth_resend_code(request: Request):
     purpose = str(body.get("purpose") or "verify").strip().lower()
     if purpose not in {"verify", "reset"}:
         raise HTTPException(status_code=400, detail="Невідома мета коду")
-    if not GMAIL_RE.match(email):
-        raise HTTPException(status_code=400, detail="Введіть коректну адресу Gmail")
+    if not EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Введіть коректну адресу електронної пошти")
     teacher = db.get_teacher_by_email(email)
     if not teacher:
         # Don't leak account existence for reset.
@@ -256,8 +256,8 @@ async def auth_resend_code(request: Request):
 async def auth_forgot(request: Request):
     body = await read_json_body(request)
     email = str(body.get("email") or "").strip().lower()
-    if not GMAIL_RE.match(email):
-        raise HTTPException(status_code=400, detail="Введіть коректну адресу Gmail")
+    if not EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Введіть коректну адресу електронної пошти")
     teacher = db.get_teacher_by_email(email)
     if teacher:
         _issue_auth_code(email, "reset")
@@ -274,8 +274,8 @@ async def auth_reset(request: Request, response: Response):
     email = str(body.get("email") or "").strip().lower()
     code = str(body.get("code") or "").strip()
     new_password = str(body.get("password") or body.get("new_password") or "")
-    if not GMAIL_RE.match(email) or not re.fullmatch(r"\d{8}", code):
-        raise HTTPException(status_code=400, detail="Потрібні Gmail і код з 8 цифр")
+    if not EMAIL_RE.match(email) or not re.fullmatch(r"\d{8}", code):
+        raise HTTPException(status_code=400, detail="Потрібні пошта і код з 8 цифр")
     if len(new_password) < 6:
         raise HTTPException(status_code=400, detail="Пароль має містити щонайменше 6 символів")
     if not db.consume_auth_code(email, "reset", _code_hash(email, "reset", code)):
@@ -326,8 +326,8 @@ async def auth_google(request: Request, response: Response):
         raise HTTPException(status_code=401, detail=f"Невірний Google токен: {exc}") from exc
 
     email = str(info.get("email") or "").strip().lower()
-    if not GMAIL_RE.match(email):
-        raise HTTPException(status_code=400, detail="Потрібен акаунт Gmail")
+    if not EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="У Google-акаунті немає коректної пошти")
     if not info.get("email_verified"):
         raise HTTPException(status_code=400, detail="Google-пошта не підтверджена")
 
