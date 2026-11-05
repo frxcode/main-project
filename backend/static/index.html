@@ -4,18 +4,19 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Перевірник на ШІ</title>
-    <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
+    <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
 
     <div class="auth-screen" id="auth-screen">
         <div class="auth-card">
             <div class="auth-brand">
-                <img class="brand-mark" src="/static/logo.svg" alt="" width="36" height="36">
+                <span class="brand-mark" aria-hidden="true"></span>
                 <span>Перевірник на ШІ</span>
             </div>
             <h2 id="auth-title">Вхід для вчителя</h2>
@@ -47,7 +48,7 @@
     <div id="app" class="hidden">
         <header class="top-bar">
             <div class="logo" onclick="loadMainView()" style="cursor: pointer;">
-                <img class="brand-mark" src="/static/logo.svg" alt="" width="28" height="28">
+                <span class="brand-mark" aria-hidden="true"></span>
                 <span>Перевірник на ШІ</span>
             </div>
             <div class="top-bar-right">

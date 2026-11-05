@@ -239,6 +239,15 @@ def read_root():
     return {"status": "ok", "message": "Static frontend not found"}
 
 
+@app.get("/favicon.svg")
+@app.get("/favicon.ico")
+def favicon():
+    path = STATIC_DIR / "logo.svg"
+    if path.exists():
+        return FileResponse(path, media_type="image/svg+xml")
+    raise HTTPException(status_code=404, detail="favicon not found")
+
+
 @app.get("/api/students")
 def get_students(teacher=Depends(require_teacher)):
     students = db.list_students_for_teacher(teacher["id"])

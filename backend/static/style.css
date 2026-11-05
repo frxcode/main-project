@@ -89,6 +89,12 @@ body {
     letter-spacing: -0.02em;
 }
 
+.logo::before,
+.auth-brand::before {
+    content: none !important;
+    display: none !important;
+}
+
 .brand-mark {
     width: 28px;
     height: 28px;
@@ -96,6 +102,7 @@ body {
     box-shadow: var(--shadow-sm);
     flex: none;
     display: block;
+    background: url("/static/logo.svg?v=3") center / cover no-repeat;
 }
 
 .top-bar-right {
