@@ -9,19 +9,26 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=5">
+    <link rel="stylesheet" href="/static/style.css?v=6">
     <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 
     <div class="auth-screen" id="auth-screen">
-        <div class="auth-card">
+        <div class="auth-orb auth-orb-a" aria-hidden="true"></div>
+        <div class="auth-orb auth-orb-b" aria-hidden="true"></div>
+        <div class="auth-orb auth-orb-c" aria-hidden="true"></div>
+
+        <div class="auth-card" id="auth-card" data-mode="login">
+            <div class="auth-glow" aria-hidden="true"></div>
             <div class="auth-brand">
                 <span class="brand-mark" aria-hidden="true"></span>
                 <span>АнтиГПТшник</span>
             </div>
+            <div class="auth-step-dots" id="auth-step-dots" aria-hidden="true"></div>
             <h2 id="auth-title">Вхід для вчителя</h2>
             <p class="auth-sub" id="auth-subtitle">Увійдіть, щоб керувати перевіркою робіт учнів.</p>
+            <div class="auth-email-chip hidden" id="auth-email-chip"></div>
 
             <div class="auth-tabs" id="auth-tabs">
                 <button type="button" id="tab-login" class="active" onclick="setAuthMode('login')">Увійти</button>
@@ -32,22 +39,39 @@
             <div class="auth-ok" id="auth-ok"></div>
 
             <form id="auth-form" onsubmit="return handleAuthSubmit(event)">
-                <div class="field">
+                <div class="field" id="auth-email-field">
                     <label for="auth-email">Електронна пошта</label>
-                    <input type="email" id="auth-email" placeholder="teacher@school.edu" autocomplete="email" required>
+                    <input type="email" id="auth-email" placeholder="teacher@school.edu" autocomplete="email">
                 </div>
                 <div class="field" id="auth-password-field">
                     <label for="auth-password">Пароль</label>
                     <input type="password" id="auth-password" placeholder="••••••••" autocomplete="current-password" minlength="6">
                 </div>
+
                 <div class="field hidden" id="auth-code-field">
-                    <label for="auth-code">Код з пошти (8 цифр)</label>
-                    <input type="text" id="auth-code" inputmode="numeric" pattern="\d{8}" maxlength="8" placeholder="12345678" autocomplete="one-time-code">
+                    <label>Код з пошти</label>
+                    <div class="otp-row" id="otp-row" aria-label="8-значний код">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="0" autocomplete="one-time-code">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="1">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="2">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="3">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="4">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="5">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="6">
+                        <input class="otp-digit" type="text" inputmode="numeric" maxlength="1" data-otp="7">
+                    </div>
+                    <input type="hidden" id="auth-code" value="">
                 </div>
+
                 <div class="field hidden" id="auth-new-password-field">
                     <label for="auth-new-password">Новий пароль</label>
                     <input type="password" id="auth-new-password" placeholder="••••••••" minlength="6" autocomplete="new-password">
                 </div>
+                <div class="field hidden" id="auth-confirm-password-field">
+                    <label for="auth-confirm-password">Повторіть новий пароль</label>
+                    <input type="password" id="auth-confirm-password" placeholder="••••••••" minlength="6" autocomplete="new-password">
+                </div>
+
                 <button type="submit" class="btn-primary auth-submit" id="auth-submit-btn">Увійти</button>
             </form>
 
@@ -63,7 +87,7 @@
                 <p class="auth-foot" id="google-hint">Увімкніть Google Sign-In у налаштуваннях сервера.</p>
             </div>
 
-            <p class="auth-foot">Підтвердження — 8-значним кодом на вашу пошту.</p>
+            <p class="auth-foot" id="auth-foot">Підтвердження — 8-значним кодом на вашу пошту.</p>
         </div>
     </div>
 
@@ -230,7 +254,9 @@
         let authMode = 'login';
         let currentTeacherEmail = null;
         let pendingAuthEmail = null;
+        let pendingResetCode = null;
         let googleClientId = '';
+        let otpBound = false;
 
         function isAuthenticated() {
             return !!currentTeacherEmail;
@@ -255,44 +281,142 @@
             document.getElementById('auth-ok').classList.remove('show');
         }
 
+        function syncOtpValue() {
+            const digits = [...document.querySelectorAll('.otp-digit')].map((el) => el.value.replace(/\D/g, '')).join('');
+            document.getElementById('auth-code').value = digits;
+            return digits;
+        }
+
+        function clearOtp() {
+            document.querySelectorAll('.otp-digit').forEach((el) => { el.value = ''; });
+            document.getElementById('auth-code').value = '';
+        }
+
+        function focusOtp(index = 0) {
+            const el = document.querySelector(`.otp-digit[data-otp="${index}"]`);
+            if (el) el.focus();
+        }
+
+        function bindOtpInputs() {
+            if (otpBound) return;
+            otpBound = true;
+            const inputs = [...document.querySelectorAll('.otp-digit')];
+            inputs.forEach((input, idx) => {
+                input.addEventListener('input', (e) => {
+                    const v = e.target.value.replace(/\D/g, '').slice(-1);
+                    e.target.value = v;
+                    syncOtpValue();
+                    if (v && idx < inputs.length - 1) inputs[idx + 1].focus();
+                });
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Backspace' && !e.target.value && idx > 0) {
+                        inputs[idx - 1].focus();
+                    }
+                });
+                input.addEventListener('paste', (e) => {
+                    e.preventDefault();
+                    const text = (e.clipboardData || window.clipboardData).getData('text').replace(/\D/g, '').slice(0, 8);
+                    text.split('').forEach((ch, i) => { if (inputs[i]) inputs[i].value = ch; });
+                    syncOtpValue();
+                    focusOtp(Math.min(text.length, 7));
+                });
+            });
+        }
+
+        function renderStepDots(mode) {
+            const host = document.getElementById('auth-step-dots');
+            const maps = {
+                forgot: { total: 3, active: 1 },
+                'reset-code': { total: 3, active: 2 },
+                'reset-password': { total: 3, active: 3 },
+                verify: { total: 2, active: 2 },
+                signup: { total: 2, active: 1 },
+            };
+            const cfg = maps[mode];
+            if (!cfg) {
+                host.classList.add('hidden');
+                host.innerHTML = '';
+                return;
+            }
+            host.classList.remove('hidden');
+            host.innerHTML = Array.from({ length: cfg.total }, (_, i) =>
+                `<span class="auth-dot${i + 1 === cfg.active ? ' active' : ''}${i + 1 < cfg.active ? ' done' : ''}"></span>`
+            ).join('');
+        }
+
+        function pulseAuthCard() {
+            const card = document.getElementById('auth-card');
+            card.classList.remove('auth-swap');
+            void card.offsetWidth;
+            card.classList.add('auth-swap');
+        }
+
         function setAuthMode(mode) {
             authMode = mode;
             clearAuthError();
+            bindOtpInputs();
+            pulseAuthCard();
+
             const isLogin = mode === 'login';
             const isSignup = mode === 'signup';
             const isVerify = mode === 'verify';
             const isForgot = mode === 'forgot';
-            const isReset = mode === 'reset';
+            const isResetCode = mode === 'reset-code';
+            const isResetPassword = mode === 'reset-password';
+            const isCodeStep = isVerify || isResetCode;
+            const isSpecial = isVerify || isForgot || isResetCode || isResetPassword;
 
-            document.getElementById('auth-tabs').classList.toggle('hidden', isVerify || isForgot || isReset);
+            document.getElementById('auth-card').dataset.mode = mode;
+            document.getElementById('auth-tabs').classList.toggle('hidden', isSpecial);
             document.getElementById('tab-login').classList.toggle('active', isLogin);
             document.getElementById('tab-signup').classList.toggle('active', isSignup);
 
-            document.getElementById('auth-password-field').classList.toggle('hidden', isVerify || isForgot || isReset);
-            document.getElementById('auth-code-field').classList.toggle('hidden', !(isVerify || isReset));
-            document.getElementById('auth-new-password-field').classList.toggle('hidden', !isReset);
-            document.getElementById('resend-link').classList.toggle('hidden', !(isVerify || isReset));
+            document.getElementById('auth-email-field').classList.toggle('hidden', isVerify || isResetCode || isResetPassword);
+            document.getElementById('auth-password-field').classList.toggle('hidden', !isLogin && !isSignup);
+            document.getElementById('auth-code-field').classList.toggle('hidden', !isCodeStep);
+            document.getElementById('auth-new-password-field').classList.toggle('hidden', !isResetPassword);
+            document.getElementById('auth-confirm-password-field').classList.toggle('hidden', !isResetPassword);
+
+            document.getElementById('resend-link').classList.toggle('hidden', !(isVerify || isResetCode));
             document.getElementById('back-login-link').classList.toggle('hidden', isLogin || isSignup);
             document.getElementById('forgot-link').classList.toggle('hidden', !isLogin);
             document.getElementById('google-divider').classList.toggle('hidden', !(isLogin || isSignup));
             document.getElementById('google-btn-wrap').classList.toggle('hidden', !(isLogin || isSignup));
+            document.getElementById('auth-foot').classList.toggle('hidden', isSpecial);
+
+            const chip = document.getElementById('auth-email-chip');
+            if (pendingAuthEmail && (isVerify || isResetCode || isResetPassword)) {
+                chip.textContent = pendingAuthEmail;
+                chip.classList.remove('hidden');
+                document.getElementById('auth-email').value = pendingAuthEmail;
+            } else {
+                chip.classList.add('hidden');
+            }
 
             const titles = {
                 login: ['Вхід для вчителя', 'Увійдіть через пошту або Google.', 'Увійти'],
-                signup: ['Реєстрація', 'Створіть акаунт — надішлемо код підтвердження на пошту.', 'Створити акаунт'],
-                verify: ['Підтвердження пошти', 'Введіть 8-значний код з листа.', 'Підтвердити'],
-                forgot: ['Забули пароль?', 'Вкажіть пошту — надішлемо код скидання.', 'Надіслати код'],
-                reset: ['Новий пароль', 'Введіть код з листа і новий пароль.', 'Зберегти пароль'],
+                signup: ['Реєстрація', 'Створіть акаунт — код підтвердження прийде окремим кроком.', 'Створити акаунт'],
+                verify: ['Код з пошти', 'Введіть 8 цифр з листа — окремий крок підтвердження.', 'Підтвердити'],
+                forgot: ['Забули пароль?', 'Крок 1 з 3 — вкажіть пошту, надішлемо код.', 'Надіслати код'],
+                'reset-code': ['Код з пошти', 'Крок 2 з 3 — введіть 8-значний код з листа.', 'Далі'],
+                'reset-password': ['Новий пароль', 'Крок 3 з 3 — новий пароль і повтор на одній сторінці.', 'Зберегти пароль'],
             };
             const [title, sub, btn] = titles[mode] || titles.login;
             document.getElementById('auth-title').textContent = title;
             document.getElementById('auth-subtitle').textContent = sub;
             document.getElementById('auth-submit-btn').textContent = btn;
             document.getElementById('auth-password').required = isLogin || isSignup;
-            document.getElementById('auth-code').required = isVerify || isReset;
-            document.getElementById('auth-new-password').required = isReset;
-            if (pendingAuthEmail && (isVerify || isReset || isForgot)) {
-                document.getElementById('auth-email').value = pendingAuthEmail;
+            document.getElementById('auth-email').required = isLogin || isSignup || isForgot;
+            document.getElementById('auth-new-password').required = isResetPassword;
+            document.getElementById('auth-confirm-password').required = isResetPassword;
+
+            renderStepDots(mode);
+            if (isCodeStep) {
+                clearOtp();
+                setTimeout(() => focusOtp(0), 180);
+            }
+            if (mode === 'login' || mode === 'signup') {
+                pendingResetCode = null;
             }
         }
 
@@ -300,12 +424,14 @@
             event.preventDefault();
             clearAuthError();
 
-            const email = document.getElementById('auth-email').value.trim().toLowerCase();
+            const email = (document.getElementById('auth-email').value.trim().toLowerCase() || pendingAuthEmail || '');
             const password = document.getElementById('auth-password').value;
-            const code = document.getElementById('auth-code').value.trim();
+            const code = syncOtpValue() || (pendingResetCode || '');
             const newPassword = document.getElementById('auth-new-password').value;
+            const confirmPassword = document.getElementById('auth-confirm-password').value;
 
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            if ((authMode === 'login' || authMode === 'signup' || authMode === 'forgot') &&
+                !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
                 showAuthError('Введіть коректну адресу електронної пошти.');
                 return false;
             }
@@ -313,13 +439,24 @@
                 showAuthError('Пароль має містити щонайменше 6 символів.');
                 return false;
             }
-            if ((authMode === 'verify' || authMode === 'reset') && !/^\d{8}$/.test(code)) {
+            if ((authMode === 'verify' || authMode === 'reset-code') && !/^\d{8}$/.test(syncOtpValue())) {
                 showAuthError('Код має містити рівно 8 цифр.');
                 return false;
             }
-            if (authMode === 'reset' && newPassword.length < 6) {
-                showAuthError('Новий пароль має містити щонайменше 6 символів.');
-                return false;
+            if (authMode === 'reset-password') {
+                if (newPassword.length < 6) {
+                    showAuthError('Новий пароль має містити щонайменше 6 символів.');
+                    return false;
+                }
+                if (newPassword !== confirmPassword) {
+                    showAuthError('Паролі не збігаються.');
+                    return false;
+                }
+                if (!/^\d{8}$/.test(pendingResetCode || '')) {
+                    showAuthError('Спочатку введіть код з пошти.');
+                    setAuthMode('reset-code');
+                    return false;
+                }
             }
 
             const submitBtn = document.getElementById('auth-submit-btn');
@@ -337,7 +474,7 @@
                     if (data.status === 'need_verification') {
                         pendingAuthEmail = data.email || email;
                         setAuthMode('verify');
-                        showAuthOk(data.message || 'Код надіслано на пошту.');
+                        showAuthOk(data.message || 'Код надіслано — введіть його в цьому вікні.');
                         return false;
                     }
                     currentTeacherEmail = data.email || email;
@@ -348,11 +485,12 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         credentials: 'include',
-                        body: JSON.stringify({ email, code })
+                        body: JSON.stringify({ email, code: syncOtpValue() })
                     });
                     currentTeacherEmail = data.email || email;
                     pendingAuthEmail = null;
                     document.getElementById('auth-form').reset();
+                    clearOtp();
                     enterApp();
                 } else if (authMode === 'forgot') {
                     const data = await fetchJson('/api/auth/forgot', {
@@ -361,18 +499,25 @@
                         body: JSON.stringify({ email })
                     });
                     pendingAuthEmail = email;
-                    setAuthMode('reset');
+                    pendingResetCode = null;
+                    setAuthMode('reset-code');
                     showAuthOk(data.message || 'Якщо акаунт існує — код надіслано.');
-                } else if (authMode === 'reset') {
+                } else if (authMode === 'reset-code') {
+                    pendingResetCode = syncOtpValue();
+                    setAuthMode('reset-password');
+                    showAuthOk('Код прийнято. Тепер задайте новий пароль.');
+                } else if (authMode === 'reset-password') {
                     const data = await fetchJson('/api/auth/reset', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         credentials: 'include',
-                        body: JSON.stringify({ email, code, password: newPassword })
+                        body: JSON.stringify({ email, code: pendingResetCode, password: newPassword })
                     });
                     currentTeacherEmail = data.email || email;
                     pendingAuthEmail = null;
+                    pendingResetCode = null;
                     document.getElementById('auth-form').reset();
+                    clearOtp();
                     enterApp();
                 }
             } catch (error) {
@@ -390,14 +535,17 @@
                 showAuthError('Введіть коректну адресу електронної пошти.');
                 return;
             }
-            const purpose = authMode === 'reset' ? 'reset' : 'verify';
+            const purpose = (authMode === 'reset-code' || authMode === 'reset-password') ? 'reset' : 'verify';
             try {
                 const data = await fetchJson('/api/auth/resend-code', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email, purpose })
                 });
+                clearOtp();
+                if (authMode === 'reset-password') setAuthMode('reset-code');
                 showAuthOk(data.message || 'Код надіслано повторно.');
+                focusOtp(0);
             } catch (error) {
                 showAuthError(error.message || 'Не вдалося надіслати код.');
             }
